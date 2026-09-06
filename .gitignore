@@ -1,1 +1,6 @@
 config.py
+__pycache__/
+*.pyc
+.jarvis.pid
+jarvis.log
+wiz_cache.json
