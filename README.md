@@ -224,19 +224,23 @@ This project is licensed under the **MIT License**.
 
 ---
 
-## 👤 Author
+## Author ✍️
 
-**[Muhammad Zeeshan Islam](https://github.com/zeeshan020dev)**
-  
-Co-Founder – [Unicodrex](https://www.linkedin.com/company/unicodrex/) | Technical Lead – [Skill Sprint](https://www.linkedin.com/company/skill-sprint-pk/) | Trainee Game Developer – [CEGA](https://www.linkedin.com/company/cegaofficialpk/) | Prompt Engineer
+Click the box below to visit the author's GitHub profile and explore more projects, open-source work, and contributions.
 
-[![GitHub](https://img.shields.io/badge/GitHub-zeeshan020dev-black?logo=github)](https://github.com/zeeshan020dev)
-
-
----
-
-## ⭐ Support
-
-If you like this project, please ⭐ star the repository and share it!
-
----
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="220px">
+        <a href="https://github.com/zeeshan020dev">
+          <img src="https://github.com/zeeshan020dev.png?size=100" width="100px;" alt="Muhammad Zeeshan Islam"/>
+          <br />
+          <sub><b>Muhammad&nbsp;Zeeshan&nbsp;Islam</b></sub>
+        </a>
+        <br />
+        <a href="https://github.com/zeeshan020dev" title="GitHub Profile">💻</a>
+        <a href="https://github.com/zeeshan020dev" title="Documentation">📖</a>
+      </td>
+    </tr>
+  </tbody>
+</table>
