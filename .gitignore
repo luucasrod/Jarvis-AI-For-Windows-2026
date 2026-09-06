@@ -4,3 +4,5 @@ __pycache__/
 .jarvis.pid
 jarvis.log
 wiz_cache.json
+jarvis_memory.json
+jarvis_paperclip_actions.log

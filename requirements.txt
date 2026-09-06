@@ -1,4 +1,9 @@
 google-genai
-speechrecognition
+groq
+edge-tts
+SpeechRecognition
 pyttsx3
-pyaudio
+sounddevice
+soundfile
+numpy
+requests
