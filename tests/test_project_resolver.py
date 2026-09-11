@@ -183,3 +183,61 @@ def test_recovery_with_same_instance_after_index_is_fixed(tmp_path):
     fixed = resolver.resolve("Hub")
     assert isinstance(fixed, ProjectContext)
     assert fixed.canonical_id == "argos_hub"
+
+
+# --- Regression tests from Codex's 2nd review pass on #60 (PR #71) --------
+# _validate_structure checked top-level shape but not each project's
+# container-typed fields, which _build_context wraps unconditionally in
+# list()/dict() - a scalar there (e.g. "commands": 42) crashed with
+# TypeError despite the earlier structural checks passing.
+
+def _index_with_bad_project_field(field_name: str, bad_value) -> dict:
+    return {
+        "canonical_ids": {"cashy": ["Cashy"]},
+        "projects": {"cashy": {field_name: bad_value}},
+    }
+
+
+def test_always_read_as_int_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(_index_with_bad_project_field("always_read", 42)), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_conditional_context_as_int_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(_index_with_bad_project_field("conditional_context", 42)), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_commands_as_int_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(_index_with_bad_project_field("commands", 42)), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_warnings_as_int_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(_index_with_bad_project_field("warnings", 42)), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_recovery_after_bad_container_field_is_fixed(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(_index_with_bad_project_field("commands", 42)), encoding="utf-8")
+    resolver = ProjectResolver(str(index_path))
+
+    assert isinstance(resolver.resolve("cashy"), ResolveError)
+
+    time.sleep(0.05)
+    index_path.write_text(
+        json.dumps({"canonical_ids": {"cashy": ["Cashy"]}, "projects": {"cashy": {"commands": {"dev": "npm start"}}}}),
+        encoding="utf-8",
+    )
+    fixed = resolver.resolve("cashy")
+    assert isinstance(fixed, ProjectContext)
+    assert fixed.commands == {"dev": "npm start"}

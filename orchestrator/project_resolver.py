@@ -107,6 +107,28 @@ class ProjectResolver:
                 return ResolveError(
                     reason=f"indice invalido: entrada de projeto '{canonical_id}' deveria ser um objeto (dict)"
                 )
+            if not isinstance(project, dict):
+                continue
+
+            # Found by review #60 (2nd pass): _build_context wraps these
+            # 4 fields in list()/dict() unconditionally - a scalar value
+            # here (e.g. `"commands": 42`) crashed with TypeError instead
+            # of returning a structured error, even though the top-level
+            # shape checks above already passed.
+            for list_field in ("always_read", "conditional_context", "warnings"):
+                value = project.get(list_field)
+                if value is not None and not isinstance(value, list):
+                    return ResolveError(
+                        reason=(
+                            f"indice invalido: '{list_field}' do projeto '{canonical_id}' "
+                            "deveria ser uma lista"
+                        )
+                    )
+            commands = project.get("commands")
+            if commands is not None and not isinstance(commands, dict):
+                return ResolveError(
+                    reason=f"indice invalido: 'commands' do projeto '{canonical_id}' deveria ser um objeto (dict)"
+                )
 
         return None
 
