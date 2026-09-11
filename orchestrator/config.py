@@ -10,12 +10,18 @@ and fill in real values locally.
 """
 from __future__ import annotations
 
+import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _REPO_ROOT / ".env"
+_LOGGER = logging.getLogger(__name__)
+_DEFAULT_RETRY_INTERVAL_SECONDS = 30.0
+# Matches the existing Paperclip client's six-second request timeout.
+_DEFAULT_PAPERCLIP_TIMEOUT_SECONDS = 6.0
 
 
 def _load_dotenv(path: Path) -> None:
@@ -53,6 +59,20 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _positive_seconds(value: str | None) -> float | None:
+    """Reject zero, negative and non-finite durations before client use."""
+    try:
+        seconds = float(value) if value else 0.0
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
+def _get_seconds(name: str, default: float) -> float:
+    parsed = _positive_seconds(_get(name))
+    return parsed if parsed is not None else default
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     telegram_bot_token: str | None = field(default=None)
@@ -65,6 +85,8 @@ class OrchestratorConfig:
     report_time: str = "17:00"
     rate_limit_backoff_minutes: int = 30
     secondbrain_index_path: str = r"A:\SecondBrain\project_context_index.json"
+    retry_interval_seconds: float = _DEFAULT_RETRY_INTERVAL_SECONDS
+    paperclip_timeout_seconds: float = _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS
 
 
 def load_config() -> OrchestratorConfig:
@@ -84,15 +106,24 @@ def load_config() -> OrchestratorConfig:
         secondbrain_index_path=_get(
             "SECONDBRAIN_INDEX_PATH", r"A:\SecondBrain\project_context_index.json"
         ),
+        retry_interval_seconds=_get_seconds(
+            "RETRY_INTERVAL_SECONDS", _DEFAULT_RETRY_INTERVAL_SECONDS
+        ),
+        paperclip_timeout_seconds=_get_seconds(
+            "PAPERCLIP_TIMEOUT_SECONDS", _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS
+        ),
     )
 
 
 def validate_config(config: OrchestratorConfig | None = None) -> list[str]:
-    """Returns a list of human-readable warnings for missing OPTIONAL
-    configuration (e.g. Telegram not configured). Never raises - the
-    orchestrator must keep working with Telegram/other integrations
-    simply disabled when their config is absent. Extended by issue #16
-    as more configuration keys are added in later waves."""
+    """Log and return configuration warnings without requiring credentials.
+
+    All current settings are optional or have defaults; there are no
+    mandatory startup secrets. Existing callers still receive the warning
+    list. Raw environment values (including tokens) are never logged.
+    Called once when this configuration module is first imported at
+    startup; callers may also revalidate after changing configuration.
+    """
     cfg = config or load_config()
     warnings: list[str] = []
     if not cfg.telegram_bot_token:
@@ -101,4 +132,21 @@ def validate_config(config: OrchestratorConfig | None = None) -> list[str]:
         warnings.append("TELEGRAM_CONTROL_CHAT_ID nao configurado - canal de controle desabilitado.")
     if not cfg.telegram_report_chat_id:
         warnings.append("TELEGRAM_REPORT_CHAT_ID nao configurado - canal de relatorio desabilitado.")
+    for name, default in (
+        ("RETRY_INTERVAL_SECONDS", _DEFAULT_RETRY_INTERVAL_SECONDS),
+        ("PAPERCLIP_TIMEOUT_SECONDS", _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS),
+    ):
+        raw = _get(name)
+        if raw is not None and _positive_seconds(raw) is None:
+            warnings.append(
+                f"{name} deve ser um numero finito maior que zero - "
+                f"usando default de {default:g} segundos ao carregar configuracao."
+            )
+    for warning in warnings:
+        _LOGGER.warning(warning)
     return warnings
+
+
+# Configuration is imported by orchestrator entry points; validate here
+# without importing the voice monolith or starting a background service.
+validate_config()

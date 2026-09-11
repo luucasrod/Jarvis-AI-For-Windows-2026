@@ -1,5 +1,8 @@
 """Tests for orchestrator.config (issue #9)."""
 import importlib
+import logging
+
+import pytest
 
 import orchestrator.config as config_module
 
@@ -16,6 +19,8 @@ def _reload_with_clean_env(monkeypatch, **env_overrides):
         "REPORT_TIME",
         "RATE_LIMIT_BACKOFF_MINUTES",
         "SECONDBRAIN_INDEX_PATH",
+        "RETRY_INTERVAL_SECONDS",
+        "PAPERCLIP_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env_overrides.items():
@@ -36,6 +41,8 @@ def test_defaults_when_env_absent(monkeypatch):
     assert cfg.report_time == "17:00"
     assert cfg.rate_limit_backoff_minutes == 30
     assert cfg.secondbrain_index_path == r"A:\SecondBrain\project_context_index.json"
+    assert cfg.retry_interval_seconds == 30.0
+    assert cfg.paperclip_timeout_seconds == 6.0
 
 
 def test_secondbrain_index_path_overridable(monkeypatch):
@@ -105,3 +112,65 @@ def test_dotenv_file_fills_missing_values(tmp_path, monkeypatch):
 
     assert config_module.os.environ.get("PAPERCLIP_BASE_URL") == "http://127.0.0.1:4242"
     del config_module.os.environ["PAPERCLIP_BASE_URL"]
+
+
+def test_duration_overrides_and_complete_config_are_valid(monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="orchestrator.config"):
+        mod = _reload_with_clean_env(
+            monkeypatch,
+            TELEGRAM_BOT_TOKEN="fake-token-not-for-logs",
+            TELEGRAM_CONTROL_CHAT_ID="111",
+            TELEGRAM_REPORT_CHAT_ID="222",
+            RETRY_INTERVAL_SECONDS="2.5",
+            PAPERCLIP_TIMEOUT_SECONDS="0.75",
+            SECONDBRAIN_INDEX_PATH=r"C:\projects\index.json",
+        )
+        cfg = mod.load_config()
+        assert cfg.retry_interval_seconds == 2.5
+        assert cfg.paperclip_timeout_seconds == 0.75
+        assert cfg.secondbrain_index_path == r"C:\projects\index.json"
+        assert mod.validate_config(cfg) == []
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("name,default", [
+    ("RETRY_INTERVAL_SECONDS", 30.0),
+    ("PAPERCLIP_TIMEOUT_SECONDS", 6.0),
+])
+@pytest.mark.parametrize("invalid", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_invalid_durations_fall_back_and_log_names_only(monkeypatch, caplog, name, default, invalid):
+    mod = _reload_with_clean_env(monkeypatch, **{name: invalid})
+    cfg = mod.load_config()
+    assert getattr(cfg, name.lower()) == default
+    assert any(name in message for message in caplog.messages)
+    assert all(invalid not in message for message in caplog.messages if invalid == "not-a-number")
+
+
+def test_empty_dotenv_is_valid_and_missing_options_log_at_startup(tmp_path, monkeypatch, caplog):
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    mod = _reload_with_clean_env(monkeypatch)
+    mod._load_dotenv(env_file)
+    warnings = mod.validate_config()
+    assert len(warnings) == 3
+    assert all(message in caplog.messages for message in warnings)
+    assert mod.load_config().retry_interval_seconds == 30.0
+
+
+def test_new_settings_dotenv_and_environment_precedence(tmp_path, monkeypatch):
+    mod = _reload_with_clean_env(monkeypatch, RETRY_INTERVAL_SECONDS="7")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "RETRY_INTERVAL_SECONDS=90\nPAPERCLIP_TIMEOUT_SECONDS=4.5\n"
+        "SECONDBRAIN_INDEX_PATH=C:/projects/index.json\n", encoding="utf-8",
+    )
+    # Register restoration for environment variables set by the loader.
+    monkeypatch.setenv("PAPERCLIP_TIMEOUT_SECONDS", "")
+    monkeypatch.delenv("PAPERCLIP_TIMEOUT_SECONDS")
+    monkeypatch.setenv("SECONDBRAIN_INDEX_PATH", "")
+    monkeypatch.delenv("SECONDBRAIN_INDEX_PATH")
+    mod._load_dotenv(env_file)
+    cfg = mod.load_config()
+    assert cfg.retry_interval_seconds == 7.0
+    assert cfg.paperclip_timeout_seconds == 4.5
+    assert cfg.secondbrain_index_path == "C:/projects/index.json"
