@@ -76,6 +76,24 @@ class Store:
         with self._lock:
             self._conn.close()
 
+    # --- generic helpers for other modules sharing this connection -----
+    # Added in #14 so events.py (and future modules) can add their own
+    # tables/queries without reaching into Store's private attributes.
+
+    def ensure_schema(self, schema_sql: str) -> None:
+        with self._lock:
+            self._conn.executescript(schema_sql)
+            self._conn.commit()
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        with self._lock:
+            self._conn.execute(sql, params)
+            self._conn.commit()
+
+    def query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
     # --- tasks -------------------------------------------------------
 
     def save_task(self, task: Task) -> None:
