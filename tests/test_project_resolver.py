@@ -129,3 +129,57 @@ def test_index_reload_on_mtime_change(tmp_path):
     index_path.write_text(json.dumps(updated), encoding="utf-8")
 
     assert resolver.resolve("Hub").root == "A:\\Argos-Hub-Moved"
+
+
+# --- Regression tests from Codex's review (Review Task #60, PR #59) ---------
+# 4 corrupt-index reproductions that used to crash with AttributeError/
+# UnicodeDecodeError instead of returning a structured ResolveError.
+
+def test_canonical_ids_as_list_instead_of_dict_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps([]), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("Hub")
+    assert isinstance(result, ResolveError)
+
+
+def test_aliases_as_string_instead_of_list_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps({"canonical_ids": ["cashy"]}), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_project_entry_as_int_instead_of_dict_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(
+        json.dumps({"canonical_ids": {"cashy": ["Cashy"]}, "projects": {"cashy": 42}}),
+        encoding="utf-8",
+    )
+    result = ProjectResolver(str(index_path)).resolve("Cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_invalid_utf8_bytes_is_structured_error_not_unicode_decode_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_bytes(b"\xff\xfe\xfa")
+    result = ProjectResolver(str(index_path)).resolve("Hub")
+    assert isinstance(result, ResolveError)
+
+
+def test_recovery_with_same_instance_after_index_is_fixed(tmp_path):
+    """A corrupt index must not poison the cache - the SAME resolver
+    instance must recover once the file is corrected, without needing a
+    new ProjectResolver()."""
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps([]), encoding="utf-8")
+    resolver = ProjectResolver(str(index_path))
+
+    broken = resolver.resolve("Hub")
+    assert isinstance(broken, ResolveError)
+
+    time.sleep(0.05)
+    index_path.write_text(json.dumps(_SAMPLE_INDEX), encoding="utf-8")
+
+    fixed = resolver.resolve("Hub")
+    assert isinstance(fixed, ProjectContext)
+    assert fixed.canonical_id == "argos_hub"

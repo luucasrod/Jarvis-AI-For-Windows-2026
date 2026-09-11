@@ -63,13 +63,52 @@ class ProjectResolver:
             data = json.loads(raw)
         except OSError as exc:
             return ResolveError(reason=f"erro ao ler indice: {exc}")
+        except UnicodeDecodeError as exc:
+            return ResolveError(reason=f"indice nao esta em UTF-8 valido: {exc}")
         except json.JSONDecodeError as exc:
             return ResolveError(reason=f"indice malformado (JSON invalido): {exc}")
+
+        # Validate STRUCTURE before caching anything - an index that
+        # parses as JSON but has the wrong shape (list instead of dict,
+        # canonical_ids as a list instead of a dict, a project entry that
+        # isn't a dict, etc) must never get cached, so a later corrected
+        # file is picked up on the very next call instead of staying
+        # stuck behind a bad cache (found in review #60: previously
+        # cached_data/mtime were updated BEFORE building the alias map,
+        # so a structurally-invalid index could poison the cache).
+        error = self._validate_structure(data)
+        if error is not None:
+            return error
 
         self._cached_data = data
         self._cached_mtime = mtime
         self._cached_alias_map = self._build_alias_map(data)
         return data
+
+    @staticmethod
+    def _validate_structure(data) -> ResolveError | None:
+        if not isinstance(data, dict):
+            return ResolveError(reason=f"indice invalido: esperava um objeto JSON, recebeu {type(data).__name__}")
+
+        canonical_ids = data.get("canonical_ids", {})
+        if not isinstance(canonical_ids, dict):
+            return ResolveError(reason="indice invalido: 'canonical_ids' deveria ser um objeto (dict)")
+        for canonical_id, aliases in canonical_ids.items():
+            if aliases is not None and not isinstance(aliases, list):
+                return ResolveError(
+                    reason=f"indice invalido: aliases de '{canonical_id}' deveriam ser uma lista"
+                )
+
+        projects = data.get("projects", {})
+        if not isinstance(projects, dict):
+            return ResolveError(reason="indice invalido: 'projects' deveria ser um objeto (dict)")
+        for canonical_id, project in projects.items():
+            if project is not None and not isinstance(project, dict):
+                return ResolveError(
+                    reason=f"indice invalido: entrada de projeto '{canonical_id}' deveria ser um objeto (dict)"
+                )
+
+        return None
 
     @staticmethod
     def _build_alias_map(data: dict) -> dict[str, str]:
