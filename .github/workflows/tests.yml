@@ -15,6 +15,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-mock
+          # Kept minimal and separate from the voice assistant's full
+          # requirements.txt on purpose: several of those packages
+          # (pyttsx3, sounddevice, soundfile) need system audio libs that
+          # ubuntu-latest doesn't have out of the box and would make CI
+          # flaky/slow for something orchestrator/ doesn't even use.
+          # Add here only what orchestrator/ actually imports.
+          pip install pytest pytest-mock requests
       - name: Run tests
         run: pytest
