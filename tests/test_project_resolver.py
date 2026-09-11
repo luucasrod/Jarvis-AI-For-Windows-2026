@@ -1,0 +1,131 @@
+"""Tests for orchestrator.project_resolver (issue #15)."""
+import json
+import time
+
+from orchestrator.project_resolver import ProjectContext, ProjectResolver, ResolveError, resolve
+
+_SAMPLE_INDEX = {
+    "canonical_ids": {
+        "argos_hub": ["Hub", "Argos Hub", "hub central"],
+        "wd_pdr": ["WD PDR", "PDR", "WD-PDR-Quote"],
+        "masya_growth_agent": ["Masya Growth", "Masya Growth Agent", "growth agent"],
+        "jarvis": ["Jarvis", "assistente de voz"],
+    },
+    "projects": {
+        "argos_hub": {
+            "root": "A:\\Argos-Hub",
+            "repository_owner_repo": "luucasrod/argos-hub",
+            "primary_context": "A:\\Argos-Hub\\AGENTS.md",
+            "always_read": ["A:\\Argos-Hub\\AGENTS.md"],
+            "commands": {"dev": "open index.html"},
+            "default_branch_seen": "master",
+        },
+        "wd_pdr": {
+            "root": "A:\\CLIENTES\\APPS-WEBSITE\\WD\\WD-PDR-Quote",
+            "repository": "https://github.com/luucasrod/wd-pdr-quote.git",
+            "task_source": "docs\\ai\\FILA.md",
+        },
+        "masya_growth_agent": {
+            "root": "A:\\masya-growth-agent",
+        },
+        # 'jarvis' intentionally has NO 'projects' entry to test the
+        # inconsistent-index case.
+    },
+}
+
+
+def _write_index(tmp_path, data=None):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(data if data is not None else _SAMPLE_INDEX), encoding="utf-8")
+    return index_path
+
+
+def test_resolve_by_canonical_id(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("argos_hub")
+    assert isinstance(result, ProjectContext)
+    assert result.canonical_id == "argos_hub"
+    assert result.root == "A:\\Argos-Hub"
+
+
+def test_resolve_by_alias_case_insensitive(tmp_path):
+    index_path = _write_index(tmp_path)
+    for alias in ("Hub", "hub", "HUB", "hub central"):
+        result = ProjectResolver(str(index_path)).resolve(alias)
+        assert isinstance(result, ProjectContext), f"failed for alias {alias!r}"
+        assert result.canonical_id == "argos_hub"
+
+
+def test_resolve_multiple_known_aliases(tmp_path):
+    index_path = _write_index(tmp_path)
+    resolver = ProjectResolver(str(index_path))
+    assert resolver.resolve("PDR").canonical_id == "wd_pdr"
+    assert resolver.resolve("growth agent").canonical_id == "masya_growth_agent"
+    assert resolver.resolve("Masya Growth").canonical_id == "masya_growth_agent"
+
+
+def test_resolve_unknown_project_returns_error_with_suggestion(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("hu")
+    assert isinstance(result, ResolveError)
+    assert "nao encontrado" in result.reason
+    assert result.suggestion in ("hub", "hub central") or result.suggestion is not None
+
+
+def test_resolve_completely_unrelated_query_no_suggestion(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("xyz-nao-existe-em-lugar-nenhum")
+    assert isinstance(result, ResolveError)
+    assert result.suggestion is None
+
+
+def test_convenience_resolve_function_returns_none_on_failure(tmp_path):
+    index_path = _write_index(tmp_path)
+    assert resolve("xyz-nao-existe", str(index_path)) is None
+    assert resolve("Hub", str(index_path)) is not None
+
+
+def test_missing_index_file_returns_structured_error(tmp_path):
+    missing_path = tmp_path / "does_not_exist.json"
+    result = ProjectResolver(str(missing_path)).resolve("Hub")
+    assert isinstance(result, ResolveError)
+    assert "nao encontrado" in result.reason
+
+
+def test_malformed_json_returns_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text("{ isto nao e json valido", encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("Hub")
+    assert isinstance(result, ResolveError)
+    assert "malformado" in result.reason
+
+
+def test_missing_optional_fields_use_safe_defaults(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("PDR")
+    assert isinstance(result, ProjectContext)
+    # wd_pdr entry has no always_read/conditional_context/commands/warnings
+    assert result.always_read == []
+    assert result.conditional_context == []
+    assert result.commands == {}
+    assert result.warnings == []
+
+
+def test_canonical_id_present_but_no_projects_entry_is_structured_error(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("Jarvis")
+    assert isinstance(result, ResolveError)
+    assert "inconsistente" in result.reason
+
+
+def test_index_reload_on_mtime_change(tmp_path):
+    index_path = _write_index(tmp_path)
+    resolver = ProjectResolver(str(index_path))
+    assert resolver.resolve("Hub").root == "A:\\Argos-Hub"
+
+    updated = json.loads(json.dumps(_SAMPLE_INDEX))
+    updated["projects"]["argos_hub"]["root"] = "A:\\Argos-Hub-Moved"
+    time.sleep(0.05)
+    index_path.write_text(json.dumps(updated), encoding="utf-8")
+
+    assert resolver.resolve("Hub").root == "A:\\Argos-Hub-Moved"

@@ -64,6 +64,7 @@ class OrchestratorConfig:
     cutoff_time: str = "14:00"
     report_time: str = "17:00"
     rate_limit_backoff_minutes: int = 30
+    secondbrain_index_path: str = r"A:\SecondBrain\project_context_index.json"
 
 
 def load_config() -> OrchestratorConfig:
@@ -80,6 +81,9 @@ def load_config() -> OrchestratorConfig:
         cutoff_time=_get("CUTOFF_TIME", "14:00"),
         report_time=_get("REPORT_TIME", "17:00"),
         rate_limit_backoff_minutes=_get_int("RATE_LIMIT_BACKOFF_MINUTES", 30),
+        secondbrain_index_path=_get(
+            "SECONDBRAIN_INDEX_PATH", r"A:\SecondBrain\project_context_index.json"
+        ),
     )
 
 

@@ -15,6 +15,7 @@ def _reload_with_clean_env(monkeypatch, **env_overrides):
         "CUTOFF_TIME",
         "REPORT_TIME",
         "RATE_LIMIT_BACKOFF_MINUTES",
+        "SECONDBRAIN_INDEX_PATH",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env_overrides.items():
@@ -34,6 +35,13 @@ def test_defaults_when_env_absent(monkeypatch):
     assert cfg.cutoff_time == "14:00"
     assert cfg.report_time == "17:00"
     assert cfg.rate_limit_backoff_minutes == 30
+    assert cfg.secondbrain_index_path == r"A:\SecondBrain\project_context_index.json"
+
+
+def test_secondbrain_index_path_overridable(monkeypatch):
+    mod = _reload_with_clean_env(monkeypatch, SECONDBRAIN_INDEX_PATH=r"C:\custom\index.json")
+    cfg = mod.load_config()
+    assert cfg.secondbrain_index_path == r"C:\custom\index.json"
 
 
 def test_env_vars_override_defaults(monkeypatch):
