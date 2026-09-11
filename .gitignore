@@ -8,3 +8,6 @@ jarvis_memory.json
 jarvis_paperclip_actions.log
 .pytest_cache/
 .env
+orchestrator_state.db
+orchestrator_state.db-*
+*.db-journal
