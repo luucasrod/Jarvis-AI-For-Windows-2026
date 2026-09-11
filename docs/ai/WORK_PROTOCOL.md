@@ -19,30 +19,58 @@ wave. Só a promoção final para `main` exige (B).
 Isso existe para que Claude e Codex trabalhem horas sem precisar estar
 online ao mesmo tempo só para o outro revisar.
 
-## 2. Branches de integração por wave
+## 2. Branches de integração por CHECKPOINT (não por número de wave)
 
-`integration/wave-0`, `integration/wave-1`, ... `integration/wave-6`.
+**Atualizado em 2026-09-11.** A ideia original era uma branch por wave
+numerada (`integration/wave-0`, `wave-1`, ...). Na prática, `wave-0`
+acumulou trabalho de várias waves conceituais (#8/#9 fundação, #12-#15/#21
+core+segurança, #24/#29 política de orquestração) porque as dependências
+reais não respeitavam os números de wave da fila original. Isso é
+esperado e **não é um erro a corrigir retroativamente** — `wave-0` fica
+congelada como **baseline histórico válido**, sem cirurgia de Git.
 
-Fluxo:
+**Daqui pra frente, checkpoints são por DOMÍNIO, não por número de wave**,
+escolhendo a estrutura mínima que reflita o DAG real (não criar uma branch
+nova só porque existe um número de wave na fila):
 
 ```
 main
- -> integration/wave-X (acumula o estado testável da wave)
-     -> branch individual da Issue (worktree próprio, PR próprio)
+ -> integration/wave-0            (CONGELADA - baseline: fundação + core + segurança
+                                    + política de agente/revisão. Não recebe mais merges.)
+     -> integration/orchestration  (checkpoint ATIVO a partir de 2026-09-11:
+                                     scheduler, rate limit, idle, blocked-continuity,
+                                     wiring do ciclo diário, e qualquer issue
+                                     independente que não precise esperar um
+                                     checkpoint de domínio ainda mais à frente)
+         -> integration/user-interaction  (quando começar: Telegram, voz, NEEDS_LUCAS,
+                                            histórico end-user-facing)
+             -> integration/hardening      (merge automático, deploy, offline, idempotência)
+                 -> integration/e2e         (teste E2E final + teste real de Telegram)
+     -> branch individual da Issue (worktree próprio, PR próprio, sempre)
 ```
 
 Cada Issue continua isolada: branch própria, worktree próprio, commits
-próprios, PR próprio, evidência própria. A branch de integração só recebe
-merges (`--no-ff`, preservando histórico) das branches de Issue já
+próprios, PR próprio, evidência própria. Uma branch de checkpoint só
+recebe merges (`--no-ff`, preservando histórico) das branches de Issue já
 validadas (testes+CI verdes), nunca código solto direto.
 
-Quando a wave inteira estiver íntegra + revisões obrigatórias resolvidas +
-testes integrados passando, ela é promovida (merge) para `main`. `main`
-nunca é usada como atalho para destravar dependência — essa é a função da
-`integration/wave-X`.
+**Antes de abrir um PR de uma Issue nova, determine o checkpoint correto**
+(a branch de integração ativa mais adequada às dependências reais dessa
+Issue) em vez de assumir automaticamente a última usada. Se a Issue só
+depende de algo já em `integration/wave-0` (congelada) e não tem relação
+com o domínio do checkpoint ativo atual, ainda assim integre no checkpoint
+ATIVO (não crie uma branch nova para ela sozinha, nem volte a integrar em
+`wave-0`) — o objetivo é nunca ter mais de um checkpoint ativo recebendo
+trabalho novo por vez.
 
-Não criar uma `develop` eterna — cada `integration/wave-X` é temporária,
-existe só até a wave ser promovida.
+Quando um checkpoint de domínio estiver íntegro + revisões obrigatórias
+resolvidas + testes integrados passando, ele é promovido (merge) para
+`main`, e o PRÓXIMO checkpoint da cadeia (se ainda não existir) é criado a
+partir do commit de promoção. `main` nunca é usada como atalho para
+destravar dependência.
+
+Não criar uma `develop` eterna — cada branch de checkpoint existe só até
+ser promovida, e só existe UM checkpoint ativo por vez.
 
 ## 3. Review Tasks são trabalho real
 
