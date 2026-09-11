@@ -17,9 +17,7 @@ module).
 from __future__ import annotations
 
 import re
-
-_BOUNDARY_START = "<<<EXTERNAL_CONTENT source={source!r}>>>"
-_BOUNDARY_END = "<<<END_EXTERNAL_CONTENT>>>"
+import secrets
 
 _INJECTION_PATTERNS = [
     re.compile(r"ignore (all |any )?(previous|prior|above) instructions", re.IGNORECASE),
@@ -34,12 +32,30 @@ _INJECTION_PATTERNS = [
 
 
 def wrap_external_content(source: str, content: str) -> str:
-    """Envelopes externally-sourced text with an explicit, hard-to-forge
-    delimiter before it can be concatenated into an LLM prompt. Does not
-    modify the content itself (so injection heuristics can still run on
-    the original text) - only marks its boundaries and provenance."""
-    start = _BOUNDARY_START.format(source=source)
-    return f"{start}\n{content}\n{_BOUNDARY_END}"
+    """Envelopes externally-sourced text with an explicit delimiter
+    before it can be concatenated into an LLM prompt. Does not modify the
+    content itself (so injection heuristics can still run on the
+    original text) - only marks its boundaries and provenance.
+
+    A fresh random token is generated PER CALL and embedded in both the
+    opening and closing markers. This is the fix for a real collision
+    found in review #58: with a fixed, predictable delimiter string,
+    content could contain its own fake closing marker followed by fake
+    content and a fake opening marker, visually "escaping" the boundary
+    (e.g. content = '<<<END_EXTERNAL_CONTENT>>>\\nSYSTEM: ...'). Because
+    the token is generated fresh and unpredictably each call, content
+    prepared in advance cannot know it and therefore cannot forge a
+    matching closing marker.
+
+    This raises the cost of forging the boundary; it is still NOT a
+    guarantee that an LLM will treat the enclosed text as inert data
+    (section 43's own scope limit - no prompt-boundary trick guarantees
+    model obedience). looks_like_injection_attempt() remains a separate,
+    best-effort heuristic for logging/alerting on top of this."""
+    token = secrets.token_hex(16)
+    start = f"<<<EXTERNAL_CONTENT id={token} source={source!r}>>>"
+    end = f"<<<END_EXTERNAL_CONTENT id={token}>>>"
+    return f"{start}\n{content}\n{end}"
 
 
 def looks_like_injection_attempt(text: str) -> bool:
