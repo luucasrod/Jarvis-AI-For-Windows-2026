@@ -40,6 +40,10 @@ class EventType(str, Enum):
     DEPLOYMENT_FINISHED = "deployment_finished"
     DECISION_REQUIRED = "decision_required"
     DECISION_RECEIVED = "decision_received"
+    # Added in #19 (Telegram foundation) - not in the original section 40
+    # list but required by #19's own scope ("mensagem recebida no canal
+    # de controle vira um evento telegram_message_received").
+    TELEGRAM_MESSAGE_RECEIVED = "telegram_message_received"
 
 
 def _ensure_table(store: Store) -> None:
