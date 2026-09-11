@@ -68,3 +68,43 @@ def test_emit_defaults_payload_to_empty_dict(tmp_path):
     events = query_events(store)
     assert events[0]["payload"] == {}
     store.close()
+
+
+# --- Regression tests from Codex's review (Review Task #56, PR #55) --------
+# `since` with a non-UTC offset (e.g. Europe/Lisbon's +01:00 in summer)
+# compared as a raw ISO string against UTC-stored created_at and silently
+# returned the wrong result.
+
+def test_since_with_positive_utc_offset_matches_equivalent_utc_instant(tmp_path):
+    store = Store(tmp_path / "state.db")
+    emit(store, EventType.TASK_CREATED, {})
+
+    event_time = query_events(store)[0]["created_at"]
+    one_second_before_utc = event_time - timedelta(seconds=1)
+    # exactly the same instant, expressed with a +01:00 offset instead of UTC
+    equivalent_lisbon_summer_time = one_second_before_utc.astimezone(timezone(timedelta(hours=1)))
+
+    assert len(query_events(store, since=one_second_before_utc)) == 1
+    assert len(query_events(store, since=equivalent_lisbon_summer_time)) == 1
+    store.close()
+
+
+def test_since_with_negative_utc_offset_matches_equivalent_utc_instant(tmp_path):
+    store = Store(tmp_path / "state.db")
+    emit(store, EventType.TASK_CREATED, {})
+
+    event_time = query_events(store)[0]["created_at"]
+    one_second_before_utc = event_time - timedelta(seconds=1)
+    equivalent_negative_offset_time = one_second_before_utc.astimezone(timezone(timedelta(hours=-5)))
+
+    assert len(query_events(store, since=equivalent_negative_offset_time)) == 1
+    store.close()
+
+
+def test_since_naive_datetime_is_treated_as_utc(tmp_path):
+    store = Store(tmp_path / "state.db")
+    emit(store, EventType.TASK_CREATED, {})
+
+    naive_past = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None)
+    assert len(query_events(store, since=naive_past)) == 1
+    store.close()

@@ -84,8 +84,16 @@ def query_events(
     params: list = []
 
     if since is not None:
+        # `created_at` is always stored in UTC (see emit()). Comparing
+        # ISO-8601 strings lexicographically only works when both sides
+        # use the SAME UTC offset representation - a naive `since.isoformat()`
+        # compared a value with e.g. "+01:00" (Europe/Lisbon in summer)
+        # against stored "+00:00" values and silently returned the wrong
+        # rows (found in review #56). Normalize `since` to UTC first;
+        # a naive datetime (no tzinfo) is assumed to already be UTC.
+        since_utc = since.astimezone(timezone.utc) if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
         clauses.append("created_at >= ?")
-        params.append(since.isoformat())
+        params.append(since_utc.isoformat())
     if event_types:
         placeholders = ",".join("?" for _ in event_types)
         clauses.append(f"event_type IN ({placeholders})")
