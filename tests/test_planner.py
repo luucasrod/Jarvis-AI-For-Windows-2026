@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from orchestrator.models import Task, TaskState
+from orchestrator.models import ExecutionMode, Task, TaskState
 from orchestrator.persistence import Store
 from orchestrator.planner import PlanResult, plan
 from orchestrator.project_resolver import ProjectContext, ResolveError
@@ -160,4 +160,110 @@ def test_done_duplicate_does_not_block_replanning(tmp_path):
 
     assert result.duplicate_of is None
     assert result.tasks[0].title == "Nova"
+    store.close()
+
+
+# --- Regression tests for the 5 issues Codex found in Review Task #62 -----
+# (CHANGES_REQUESTED on PR #61). Reproductions adapted directly from
+# Codex's review comment on #62, credited there.
+
+def test_original_dependency_indices_survive_filtering():
+    from orchestrator.planner import _parse_decomposition
+
+    tasks = _parse_decomposition(
+        json.dumps([None, {"title": "A"}, {"title": "B", "depends_on_index": [1]}]),
+        "cashy",
+    )
+    assert len(tasks) == 2
+    task_a, task_b = tasks
+    assert task_b.dependencies == [task_a.id]
+
+
+def test_wrong_type_dependency_does_not_crash():
+    from orchestrator.planner import _parse_decomposition
+
+    tasks = _parse_decomposition('[{"title":"A","depends_on_index":1}]', "cashy")
+    assert isinstance(tasks, list)
+    assert tasks[0].dependencies == []
+
+
+def test_bool_in_depends_on_index_is_ignored_not_treated_as_int():
+    from orchestrator.planner import _parse_decomposition
+
+    tasks = _parse_decomposition(
+        json.dumps([{"title": "A"}, {"title": "B", "depends_on_index": [True, 0]}]),
+        "cashy",
+    )
+    task_a, task_b = tasks
+    assert task_b.dependencies == [task_a.id]
+
+
+def test_solo_execution_mode_from_json_is_preserved():
+    decompose_json = json.dumps([
+        {"title": "Editar arquivo compartilhado", "objective": "mexe em main.py",
+         "execution_mode": "SOLO", "risk": "high", "depends_on_index": []}
+    ])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan(
+        "altera o arquivo compartilhado do Cashy em execucao solo por risco de conflito",
+        resolver=_FakeResolver(_SAMPLE_PROJECT),
+        llm_generate=llm,
+    )
+    assert result.tasks[0].execution_mode == ExecutionMode.SOLO
+
+
+def test_generated_task_requiring_human_decision_is_flagged_even_if_original_objective_was_innocuous():
+    decompose_json = json.dumps([
+        {"title": "Alterar billing", "objective": "Mudar billing para plano pago", "risk": "high", "depends_on_index": []}
+    ])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan("Melhore o Cashy", resolver=_FakeResolver(_SAMPLE_PROJECT), llm_generate=llm)
+
+    assert result.needs_human_decision or all(t.state == TaskState.NEEDS_LUCAS for t in result.tasks)
+
+
+def test_generated_task_dedup_against_existing_store_task(tmp_path):
+    store = Store(tmp_path / "state.db")
+    existing = Task(title="Schema", objective="Criar schema", project_id="cashy", state=TaskState.READY)
+    store.save_task(existing)
+
+    decompose_json = json.dumps([{"title": "Schema", "objective": "Criar schema", "depends_on_index": []}])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan(
+        "Implemente endpoint e schema no Cashy",
+        store=store,
+        resolver=_FakeResolver(_SAMPLE_PROJECT),
+        llm_generate=llm,
+    )
+
+    assert not any(t.objective == existing.objective and t.id != existing.id for t in result.tasks)
+    assert result.tasks[0].id == existing.id
+    store.close()
+
+
+def test_dedup_remaps_dependencies_to_existing_task_id(tmp_path):
+    store = Store(tmp_path / "state.db")
+    existing = Task(title="Schema", objective="Criar schema", project_id="cashy", state=TaskState.READY)
+    store.save_task(existing)
+
+    decompose_json = json.dumps([
+        {"title": "Schema", "objective": "Criar schema", "depends_on_index": []},
+        {"title": "Endpoint", "objective": "Criar endpoint novo", "depends_on_index": [0]},
+    ])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan(
+        "Implemente endpoint e schema no Cashy",
+        store=store,
+        resolver=_FakeResolver(_SAMPLE_PROJECT),
+        llm_generate=llm,
+    )
+
+    schema_task = next(t for t in result.tasks if t.title == "Schema")
+    endpoint_task = next(t for t in result.tasks if t.title == "Endpoint")
+    assert schema_task.id == existing.id
+    assert endpoint_task.dependencies == [existing.id]
     store.close()
