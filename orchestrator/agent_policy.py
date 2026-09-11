@@ -21,6 +21,7 @@ issue explicitly scopes that out.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from orchestrator.models import AgentClass, AgentName, ExecutionMode, Task
@@ -43,6 +44,16 @@ _MECHANICAL_KEYWORDS = [
 
 _HOTSPOT_PATTERN = re.compile(r"\bmain\.py\b", re.IGNORECASE)
 
+# Minimal, documented contract for project-specific hotspots (found
+# missing in review #64): `project_context` may optionally declare a
+# `hotspots` list of filenames/substrings - either as an attribute (a
+# dataclass/object) or a "hotspots" key (a plain dict). Nothing in the
+# real SecondBrain index or orchestrator.project_resolver.ProjectContext
+# (#15) defines this today; this is deliberately permissive so either
+# can add it later without a breaking change here.
+#   project_context.hotspots = ["shared.py", "config.py"]
+#   project_context = {"hotspots": ["shared.py"]}
+
 
 @dataclass(frozen=True)
 class AgentAssignment:
@@ -53,9 +64,18 @@ class AgentAssignment:
     reviewer_preference: AgentName
 
 
+def _strip_accents(text: str) -> str:
+    """Normalizes accented PT-BR/PT-PT characters (Seguranca vs
+    Segurança) so keyword matching doesn't depend on the caller's
+    spelling. Found in review #64: keyword lists are accent-free ASCII,
+    but real task titles/objectives are normal Portuguese prose."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
 def _matches_any(text: str, keywords: list[str]) -> bool:
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in keywords)
+    text_normalized = _strip_accents(text).lower()
+    return any(keyword in text_normalized for keyword in keywords)
 
 
 def _classify_base(task: Task) -> AgentClass:
@@ -70,9 +90,26 @@ def _classify_base(task: Task) -> AgentClass:
     return AgentClass.FLEX
 
 
-def _is_hotspot(task: Task) -> bool:
+def _extract_hotspots(project_context) -> list[str]:
+    if project_context is None:
+        hotspots = None
+    elif isinstance(project_context, dict):
+        hotspots = project_context.get("hotspots")
+    else:
+        hotspots = getattr(project_context, "hotspots", None)
+    return [str(h) for h in hotspots] if isinstance(hotspots, list) else []
+
+
+def _is_hotspot(task: Task, project_context=None) -> bool:
     combined = f"{task.title} {task.objective} {task.context} {task.probable_area or ''}"
-    return bool(_HOTSPOT_PATTERN.search(combined))
+    if _HOTSPOT_PATTERN.search(combined):
+        return True
+
+    for hotspot in _extract_hotspots(project_context):
+        pattern = re.compile(r"\b" + re.escape(hotspot) + r"\b", re.IGNORECASE)
+        if pattern.search(combined):
+            return True
+    return False
 
 
 def _pick_flex_preferred(current_load: dict[str, int] | None) -> AgentName:
@@ -99,8 +136,19 @@ def classify_task(
     project_context=None,
     current_load: dict[str, int] | None = None,
 ) -> AgentAssignment:
+    """
+    Note (raised in review #64): when a FLEX task's current_load is tied,
+    both preferred_agent and reviewer_preference come back as
+    AgentName.EITHER. That is a genuinely unresolved assignment, not a
+    real guarantee of cross-review - whatever dispatches the task (the
+    orchestration wiring, #23) MUST pick one concrete implementer and the
+    opposite concrete reviewer before execution starts. This function
+    does not do that pick itself (it has no notion of which agent is
+    actually available right now) and dynamic reassignment on rate limit
+    is explicitly #26's job, not this one's.
+    """
     agent_class = _classify_base(task)
-    execution_mode = ExecutionMode.SOLO if _is_hotspot(task) else task.execution_mode
+    execution_mode = ExecutionMode.SOLO if _is_hotspot(task, project_context) else task.execution_mode
 
     if agent_class == AgentClass.CLAUDE:
         preferred = AgentName.CLAUDE
