@@ -1,5 +1,15 @@
 # WORK_PROTOCOL — Jarvis Orchestrator
 
+> **ATUALIZADO EM 2026-09-11 — `integration/wave-0` agora é uma branch
+> CONGELADA (baseline histórico), não recebe mais merges.** A versão
+> atual e completa deste documento está em
+> `docs/ai/WORK_PROTOCOL.md` na branch **`integration/orchestration`**
+> (o checkpoint de integração ativo agora) — leia ela, não esta cópia
+> congelada. Resumo da mudança: checkpoints de integração agora são por
+> domínio (core -> orchestration -> user-interaction -> hardening -> e2e),
+> não por número de wave; `integration/wave-0` virou o baseline "core"
+> congelado, novo trabalho vai para `integration/orchestration`.
+
 Como Claude e Codex coordenam trabalho neste repositório durante a
 implementação da fila de orquestração (46 issues, waves 0-6, ver os EPICs
 #1-#7 no GitHub). Este documento é a fonte de verdade operacional — leia
