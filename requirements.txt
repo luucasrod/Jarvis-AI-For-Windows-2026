@@ -7,3 +7,7 @@ sounddevice
 soundfile
 numpy
 requests
+
+# dev/test
+pytest
+pytest-mock
