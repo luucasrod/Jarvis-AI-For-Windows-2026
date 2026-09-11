@@ -241,3 +241,33 @@ def test_recovery_after_bad_container_field_is_fixed(tmp_path):
     fixed = resolver.resolve("cashy")
     assert isinstance(fixed, ProjectContext)
     assert fixed.commands == {"dev": "npm start"}
+# --- resolve_from_text (added in #22) -------------------------------------
+
+def test_resolve_from_text_finds_alias_in_sentence(tmp_path):
+    index_path = _write_index(tmp_path)
+    resolver = ProjectResolver(str(index_path))
+    result = resolver.resolve_from_text("cria uma tela de X no Hub")
+    assert isinstance(result, ProjectContext)
+    assert result.canonical_id == "argos_hub"
+
+
+def test_resolve_from_text_picks_longest_match(tmp_path):
+    index_path = _write_index(tmp_path)
+    resolver = ProjectResolver(str(index_path))
+    result = resolver.resolve_from_text("melhora o hub central do Argos")
+    assert result.canonical_id == "argos_hub"
+
+
+def test_resolve_from_text_does_not_match_substring_inside_word(tmp_path):
+    index_path = _write_index(tmp_path)
+    resolver = ProjectResolver(str(index_path))
+    # 'PDR' nao deve casar dentro de outra palavra que a contenha
+    result = resolver.resolve_from_text("uma palavra qualquerPDRoutra sem espaco")
+    assert isinstance(result, ResolveError)
+
+
+def test_resolve_from_text_no_known_project_mentioned(tmp_path):
+    index_path = _write_index(tmp_path)
+    resolver = ProjectResolver(str(index_path))
+    result = resolver.resolve_from_text("faz uma coisa generica sem projeto nenhum")
+    assert isinstance(result, ResolveError)

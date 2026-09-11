@@ -7,11 +7,16 @@ that index itself: Masya Studio/MASYA/Masya_Studio, Cashy vs Cashy-Android,
 Argos vs Argos-Hub). 100% deterministic Python, no LLM involved (section
 11/42) - this module only resolves METADATA, it does not load the content
 of any always_read file (that is the planner's job, #22, on demand).
+
+`resolve_from_text()` was added in #22 (planner) to identify which known
+project an objective sentence refers to - additive, does not change
+`resolve()`'s existing behavior from #15.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -155,6 +160,37 @@ class ProjectResolver:
                 suggestion=suggestion,
             )
 
+        return self._build_context(canonical_id, data)
+
+    def resolve_from_text(self, text: str) -> ProjectContext | ResolveError:
+        """Scans free-form text (e.g. a planner objective sentence, not
+        just a bare project name) for the longest matching known alias,
+        as a whole word/phrase (not a substring inside an unrelated
+        word - e.g. 'HA' must not match inside 'have'). Deterministic,
+        no LLM involved (section 11/42 of PROMPT MESTRE V2): identifying
+        which known project a sentence refers to is treated as a lookup
+        problem, not a semantic one, given the index already enumerates
+        every alias explicitly."""
+        data = self._load_index()
+        if isinstance(data, ResolveError):
+            return data
+
+        alias_map = self._cached_alias_map or {}
+        text_lower = text.lower()
+
+        best_alias: str | None = None
+        for alias in alias_map:
+            pattern = r"(?<![a-z0-9_])" + re.escape(alias) + r"(?![a-z0-9_])"
+            if re.search(pattern, text_lower):
+                if best_alias is None or len(alias) > len(best_alias):
+                    best_alias = alias
+
+        if best_alias is None:
+            return ResolveError(reason=f"nenhum projeto conhecido mencionado em: {text!r}")
+
+        return self._build_context(alias_map[best_alias], data)
+
+    def _build_context(self, canonical_id: str, data: dict) -> ProjectContext | ResolveError:
         project = (data.get("projects") or {}).get(canonical_id)
         if project is None:
             return ResolveError(
