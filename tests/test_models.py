@@ -107,3 +107,29 @@ def test_solo_with_reviewer_is_valid():
         reviewer_preference=AgentName.CODEX,
     )
     assert task.execution_mode == ExecutionMode.SOLO
+
+
+# --- Regression tests from Codex's review (Review Task #52, PR #51) --------
+# Only AgentName.NONE was rejected for SOLO's reviewer_preference - None
+# and "" slipped through at runtime (the type hint isn't enforced).
+
+def test_solo_with_none_reviewer_raises():
+    with pytest.raises(TaskValidationError):
+        Task(
+            title="Solo",
+            objective="Task",
+            agent_class=AgentClass.CLAUDE,
+            execution_mode=ExecutionMode.SOLO,
+            reviewer_preference=None,
+        )
+
+
+def test_solo_with_empty_string_reviewer_raises():
+    with pytest.raises(TaskValidationError):
+        Task(
+            title="Solo",
+            objective="Task",
+            agent_class=AgentClass.CLAUDE,
+            execution_mode=ExecutionMode.SOLO,
+            reviewer_preference="",
+        )

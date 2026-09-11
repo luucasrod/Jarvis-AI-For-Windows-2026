@@ -89,10 +89,14 @@ class Task:
 
     def __post_init__(self) -> None:
         if self.execution_mode == ExecutionMode.SOLO and _reviewer_required(self.agent_class):
-            if self.reviewer_preference == AgentName.NONE:
+            # Found by review #52: only AgentName.NONE was rejected -
+            # None and "" (falsy-but-not-NONE) slipped through at
+            # runtime since the AgentName type hint isn't enforced by
+            # Python, and later crashed to_dict() on `.value` access.
+            if not self.reviewer_preference or self.reviewer_preference == AgentName.NONE:
                 raise TaskValidationError(
                     "execution_mode=SOLO com agent_class que exige revisao "
-                    "nao pode ter reviewer_preference=NONE"
+                    "nao pode ter reviewer_preference vazio/None/NONE"
                 )
 
     def to_dict(self) -> dict:
