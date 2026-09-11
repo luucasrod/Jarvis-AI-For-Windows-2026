@@ -92,3 +92,56 @@ def test_solo_flex_combination_is_valid_per_section_67():
     assert assignment.agent_class == AgentClass.FLEX
     assert assignment.execution_mode == ExecutionMode.SOLO
     assert assignment.preferred_agent == AgentName.CODEX
+
+
+# --- Regression tests from Codex's review (Review Task #64, PR #63) --------
+
+def test_accented_security_keyword_still_classifies_as_claude():
+    task = Task(title="Segurança", objective="Definir política de autorização")
+    assignment = classify_task(task)
+    assert assignment.agent_class == AgentClass.CLAUDE
+    assert assignment.preferred_agent == AgentName.CLAUDE
+
+
+def test_accented_and_unaccented_spelling_classify_the_same_way():
+    accented = classify_task(Task(title="Revisar segurança do sistema", objective="obj"))
+    unaccented = classify_task(Task(title="Revisar seguranca do sistema", objective="obj"))
+    assert accented.agent_class == unaccented.agent_class == AgentClass.CLAUDE
+
+
+def test_accent_stripping_reveals_architecture_tie_and_still_favors_claude():
+    # Before the fix: "seguranca" (accented "segurança") wasn't detected
+    # at all, so only "endpoint" (mechanical) matched and this
+    # misclassified as Codex. With accents handled, BOTH keywords are
+    # detected and the pre-existing architecture-wins-ties rule applies,
+    # same as the unaccented version of this exact sentence already did.
+    task = Task(title="Revisar segurança do endpoint", objective="obj")
+    assignment = classify_task(task)
+    assert assignment.agent_class == AgentClass.CLAUDE
+
+
+def test_hotspot_from_project_context_object_forces_solo():
+    class FakeProjectContext:
+        hotspots = ["shared.py"]
+
+    task = Task(title="Ajustar shared.py", objective="Pequena mudanca em shared.py")
+    assignment = classify_task(task, project_context=FakeProjectContext())
+    assert assignment.execution_mode == ExecutionMode.SOLO
+
+
+def test_hotspot_from_project_context_dict_forces_solo():
+    task = Task(title="Nova feature", objective="Mudar algo", probable_area="shared.py")
+    assignment = classify_task(task, project_context={"hotspots": ["shared.py"]})
+    assert assignment.execution_mode == ExecutionMode.SOLO
+
+
+def test_hotspot_not_listed_does_not_force_solo():
+    task = Task(title="Nova feature", objective="Mudar algo isolado", probable_area="isolated_module.py")
+    assignment = classify_task(task, project_context={"hotspots": ["shared.py"]})
+    assert assignment.execution_mode == ExecutionMode.PARALLEL
+
+
+def test_project_context_without_hotspots_attribute_does_not_crash():
+    task = Task(title="Nova feature", objective="Mudar algo")
+    assignment = classify_task(task, project_context=object())
+    assert assignment.execution_mode == ExecutionMode.PARALLEL
