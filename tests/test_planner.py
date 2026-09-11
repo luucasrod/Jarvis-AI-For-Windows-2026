@@ -267,3 +267,101 @@ def test_dedup_remaps_dependencies_to_existing_task_id(tmp_path):
     assert schema_task.id == existing.id
     assert endpoint_task.dependencies == [existing.id]
     store.close()
+
+
+# --- Regression tests from Codex's 2nd review pass on #62 (PR #61) ---------
+
+def test_out_of_range_dependency_reference_blocks_task_instead_of_releasing_it():
+    from orchestrator.planner import _parse_decomposition
+
+    tasks = _parse_decomposition(
+        json.dumps([{"title": "Publish dependent result", "depends_on_index": [99]}]),
+        "cashy",
+    )
+    assert len(tasks) == 1
+    assert tasks[0].state == TaskState.BLOCKED
+
+
+def test_dependency_pointing_at_filtered_invalid_item_blocks_task():
+    from orchestrator.planner import _parse_decomposition
+
+    # index 0 is an invalid item (no title) - a reference to it must not
+    # silently resolve as "no dependency".
+    tasks = _parse_decomposition(
+        json.dumps([{"no_title_here": True}, {"title": "B", "depends_on_index": [0]}]),
+        "cashy",
+    )
+    assert len(tasks) == 1
+    assert tasks[0].state == TaskState.BLOCKED
+
+
+def test_wrong_type_entry_in_depends_on_index_blocks_task():
+    from orchestrator.planner import _parse_decomposition
+
+    tasks = _parse_decomposition(
+        json.dumps([{"title": "A", "depends_on_index": ["not-an-int"]}]),
+        "cashy",
+    )
+    assert tasks[0].state == TaskState.BLOCKED
+
+
+def test_simple_cycle_between_two_tasks_is_flagged_blocked():
+    from orchestrator.planner import _parse_decomposition
+
+    tasks = _parse_decomposition(
+        json.dumps([
+            {"title": "A", "depends_on_index": [1]},
+            {"title": "B", "depends_on_index": [0]},
+        ]),
+        "cashy",
+    )
+    assert all(t.state == TaskState.BLOCKED for t in tasks)
+
+
+def test_self_dependency_alone_is_not_treated_as_a_cycle():
+    from orchestrator.planner import _parse_decomposition
+
+    # self-reference is stripped as redundant, not an error/cycle
+    tasks = _parse_decomposition(
+        json.dumps([{"title": "A", "depends_on_index": [0]}]),
+        "cashy",
+    )
+    assert tasks[0].dependencies == []
+    assert tasks[0].state == TaskState.PLANNED
+
+
+def test_flag_dependency_cycles_runs_again_after_dedup_style_remap():
+    # Direct unit test of the helper _flag_dependency_cycles is called a
+    # SECOND time (after _dedup_generated_tasks) in plan(), specifically
+    # because remapping ids during dedup can introduce a cycle that
+    # didn't exist in the raw decomposition (ids are randomly generated,
+    # so this scenario can't be triggered deterministically through
+    # plan() itself without controlling id generation - exercised
+    # directly here instead).
+    from orchestrator.planner import _flag_dependency_cycles
+
+    task_x = Task(id="x", title="X", objective="obj", dependencies=["y"])
+    task_y = Task(id="y", title="Y", objective="obj", dependencies=["x"])
+    _flag_dependency_cycles([task_x, task_y])
+    assert task_x.state == TaskState.BLOCKED
+    assert task_y.state == TaskState.BLOCKED
+
+
+def test_priority_from_decomposition_json_is_preserved():
+    decompose_json = json.dumps([
+        {"title": "Fix urgent outage", "objective": "obj", "priority": "high", "depends_on_index": []}
+    ])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan("resolve a queda urgente do Cashy", resolver=_FakeResolver(_SAMPLE_PROJECT), llm_generate=llm)
+
+    assert result.tasks[0].priority == "high"
+
+
+def test_priority_defaults_to_medium_when_absent():
+    decompose_json = json.dumps([{"title": "A", "objective": "obj", "depends_on_index": []}])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan("objetivo qualquer", resolver=_FakeResolver(_SAMPLE_PROJECT), llm_generate=llm)
+
+    assert result.tasks[0].priority == "medium"

@@ -157,7 +157,10 @@ def _build_decompose_prompt(objective: str, raw_plan_text: str, critique_text: s
         "se houver - de outras tarefas das quais esta depende, [] se "
         'nenhuma), "execution_mode": "PARALLEL"|"SOLO" (SOLO se a tarefa '
         "mexe em arquivo compartilhado/hotspot e nao pode rodar ao mesmo "
-        'tempo que outra), "risk": "low"|"medium"|"high"}.\n\n'
+        'tempo que outra), "risk": "low"|"medium"|"high", '
+        '"priority": "low"|"medium"|"high"}. NAO crie referencias '
+        "circulares em depends_on_index (A depende de B que depende de A) "
+        "nem indices fora do intervalo da lista.\n\n"
         f"OBJETIVO:\n{objective}\n\n"
         f"PLANO:\n{wrap_external_content(source='llm_plan_output', content=raw_plan_text)}\n\n"
         f"CRITICA:\n{wrap_external_content(source='llm_critique_output', content=critique_text)}\n"
@@ -207,6 +210,7 @@ def _parse_decomposition(raw_json: str, project_id: str | None) -> list[Task]:
             project_id=project_id,
             acceptance_criteria=[str(c) for c in acceptance_criteria],
             risk=str(item.get("risk") or "low"),
+            priority=str(item.get("priority") or "medium"),
             agent_class=AgentClass.FLEX,
             execution_mode=execution_mode,
             origin="planner",
@@ -219,21 +223,79 @@ def _parse_decomposition(raw_json: str, project_id: str | None) -> list[Task]:
             continue
 
         raw_indices = item.get("depends_on_index")
-        if not isinstance(raw_indices, list):
-            continue  # malformed depends_on_index -> no dependencies, don't crash
+        if raw_indices is None:
+            raw_indices = []
+        elif not isinstance(raw_indices, list):
+            # Malformed depends_on_index (wrong type entirely) - can't
+            # trust ANY of it, so treat as "no dependency declared" the
+            # same way an omitted field would be. This is different from
+            # an index that IS a list but references something invalid
+            # (handled below as an unresolved reference, not a no-op).
+            raw_indices = []
 
         dependencies = []
+        has_unresolved_reference = False
         for i in raw_indices:
             if isinstance(i, bool) or not isinstance(i, int):
+                has_unresolved_reference = True
                 continue
             if i == original_index:
-                continue  # ignore self-dependency
+                continue  # self-dependency is simply redundant, not an error
             dep_task = index_to_task.get(i)
             if dep_task is not None:
                 dependencies.append(dep_task.id)
+            else:
+                # Found by review #62 (2nd pass): an index that doesn't
+                # resolve to any task (out of range, or pointed at a
+                # filtered-out invalid item) used to silently become "no
+                # dependency", turning a task with an unmet precondition
+                # into something that looks immediately releasable. A
+                # broken reference must never look like "no dependency".
+                has_unresolved_reference = True
         task.dependencies = dependencies
+        if has_unresolved_reference:
+            task.state = TaskState.BLOCKED
 
-    return list(index_to_task.values())
+    tasks = list(index_to_task.values())
+    _flag_dependency_cycles(tasks)
+    return tasks
+
+
+def _flag_dependency_cycles(tasks: list[Task]) -> None:
+    """Detects cycles in the dependency graph (by Task.id) and marks
+    every task involved as BLOCKED - a plan where A depends on B and B
+    depends on A can never complete either task, and must never be
+    handed back looking like a normal, executable plan (review #62).
+    Mutates `tasks` in place. Called again after dedup remapping, since
+    collapsing two generated tasks into one existing store task can also
+    introduce a cycle that didn't exist in the raw decomposition."""
+    by_id = {task.id: task for task in tasks}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {task.id: WHITE for task in tasks}
+    in_cycle: set[str] = set()
+
+    def visit(task_id: str, stack: list[str]) -> None:
+        color[task_id] = GRAY
+        stack.append(task_id)
+        for dep_id in by_id[task_id].dependencies:
+            if dep_id not in by_id:
+                continue
+            if color.get(dep_id) == GRAY:
+                # found a back-edge - everything from dep_id onward in
+                # the current stack is part of the cycle
+                cycle_start = stack.index(dep_id)
+                in_cycle.update(stack[cycle_start:])
+            elif color.get(dep_id, WHITE) == WHITE:
+                visit(dep_id, stack)
+        stack.pop()
+        color[task_id] = BLACK
+
+    for task in tasks:
+        if color[task.id] == WHITE:
+            visit(task.id, [])
+
+    for task_id in in_cycle:
+        by_id[task_id].state = TaskState.BLOCKED
 
 
 def _apply_needs_human_to_generated_tasks(tasks: list[Task]) -> None:
@@ -348,6 +410,12 @@ def plan(
     # tasks - the earlier dedup check only covered the top-level
     # objective verbatim, not tasks the LLM decomposed it into.
     tasks = _dedup_generated_tasks(tasks, store, project_id)
+
+    # Dedup can collapse two distinct generated tasks into one existing
+    # store task (id_remap), which can introduce a NEW cycle that didn't
+    # exist in the raw decomposition - re-check after dedup, not just
+    # once inside _parse_decomposition.
+    _flag_dependency_cycles(tasks)
 
     return PlanResult(
         project_id=project_id,
