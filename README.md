@@ -54,6 +54,20 @@ Jarvis-AI-For-Windows/
 
 ---
 
+## 🧪 Running Tests
+
+Test dependencies (`pytest`, `pytest-mock`) are included in `requirements.txt`.
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+Tests live in `tests/`. CI runs the full suite on every push/PR via
+`.github/workflows/tests.yml`.
+
+---
+
 ## 🔑 Prerequisites
 
 Before running Jarvis, ensure you have:
