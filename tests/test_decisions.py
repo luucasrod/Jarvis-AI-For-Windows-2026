@@ -26,7 +26,8 @@ def test_format_decision_message_follows_exact_template():
         recommendation="Manter o atual por enquanto",
         impact="Sem impacto imediato se adiado",
     )
-    assert message.startswith("PROJETO:\ncashy")
+    assert message.startswith("REF: ")
+    assert "PROJETO:\ncashy" in message
     assert "CONTEXTO:" in message
     assert "PROBLEMA:\nPrecisa mudar de plano no Stripe" in message
     assert "POR QUE PRECISA DE MIM:\nEnvolve custo recorrente, decisao financeira" in message
@@ -101,6 +102,78 @@ def test_resolve_unknown_decision_returns_none(tmp_path):
     store = Store(tmp_path / "state.db")
     result = resolve_pending_decision("nao-existe", "resposta", store)
     assert result is None
+    store.close()
+
+
+# --- Regression tests from Codex's review (Review Task #80, PR #79) -------
+
+def test_second_decision_on_same_task_stays_pending_after_first_resolved(tmp_path):
+    # notify_needs_lucas -> resolve -> notify_needs_lucas with a NEW
+    # problem used to make the second message vanish from the pending
+    # queue: both calls reused task.correlation_id, so the UPSERT
+    # inherited resolved=1 from the first (already-answered) decision.
+    store = Store(tmp_path / "state.db")
+    task = Task(title="Mudar billing", objective="Mudar plano de cobranca", project_id="cashy")
+
+    notify_needs_lucas(
+        task, problem="Primeira decisao", why="motivo1",
+        options=["A"], recommendation="A", impact="baixo", store=store,
+    )
+    first_pending = store.get_pending_decisions()
+    assert len(first_pending) == 1
+    resolve_pending_decision(first_pending[0]["correlation_id"], "resposta 1", store)
+    assert store.get_pending_decisions() == []
+
+    notify_needs_lucas(
+        task, problem="Segunda decisao, problema diferente", why="motivo2",
+        options=["B"], recommendation="B", impact="alto", store=store,
+    )
+
+    pending = store.get_pending_decisions()
+    assert len(pending) == 1
+    assert "Segunda decisao" in pending[0]["message"]
+    store.close()
+
+
+def test_identical_retry_is_idempotent_not_a_duplicate(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = Task(title="X", objective="obj", project_id="cashy")
+
+    create_pending_decision(task, "mesma mensagem", store)
+    create_pending_decision(task, "mesma mensagem", store)
+
+    assert len(store.get_pending_decisions()) == 1
+    store.close()
+
+
+def test_two_pending_decisions_for_same_task_have_distinct_refs_and_correlation_ids(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = Task(title="Mudar billing", objective="obj", project_id="cashy")
+
+    notify_needs_lucas(
+        task, problem="Problema A", why="motivo",
+        options=["A"], recommendation="A", impact="baixo", store=store,
+    )
+    notify_needs_lucas(
+        task, problem="Problema B", why="motivo",
+        options=["B"], recommendation="B", impact="baixo", store=store,
+    )
+
+    pending = store.get_pending_decisions()
+    assert len(pending) == 2
+    correlation_ids = {p["correlation_id"] for p in pending}
+    assert len(correlation_ids) == 2
+
+    # each message carries a distinct REF the human can cite back, and
+    # resolving one leaves the other untouched and independently
+    # resolvable.
+    refs = {msg[: msg.index("\n")] for msg in (p["message"] for p in pending)}
+    assert len(refs) == 2
+
+    resolve_pending_decision(pending[0]["correlation_id"], "resposta", store)
+    remaining = store.get_pending_decisions()
+    assert len(remaining) == 1
+    assert remaining[0]["correlation_id"] == pending[1]["correlation_id"]
     store.close()
 
 
