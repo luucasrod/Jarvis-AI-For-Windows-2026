@@ -14,6 +14,7 @@ e uma "reason" legível, nunca uma exceção não tratada.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from urllib.parse import quote, urlencode
 
 import requests
@@ -137,6 +138,31 @@ def is_available() -> bool:
     """Checagem rápida (usada pra decidir se vale a pena tentar o relatório)."""
     _, err = _get("/api/health")
     return err is None
+
+
+def get_runtime_info(*, base_url: str | None = None, timeout: float | None = None):
+    """Read the process identity actually exposed by /api/health.
+
+    Version alone cannot identify a restart. Older servers without serverInfo
+    return a structured error; an outage is not proof of a restart either.
+    Return only the identity, never unrelated deployment/authentication metadata.
+    """
+    data, error = _get('/api/health', base_url=base_url, timeout=timeout)
+    if error:
+        return None, error
+    if not isinstance(data, dict) or data.get('status') != 'ok':
+        return None, 'invalid_runtime_info'
+    info = data.get('serverInfo')
+    started = info.get('processStartedAt') if isinstance(info, dict) else None
+    if not isinstance(started, str):
+        return None, 'runtime_identity_unavailable'
+    try:
+        instant = datetime.fromisoformat(started.replace('Z', '+00:00'))
+        if instant.utcoffset() is None:
+            raise ValueError('timezone required')
+    except ValueError:
+        return None, 'invalid_runtime_identity'
+    return {'process_started_at': instant}, None
 
 
 # ─── CAMADA DE ESCRITA (comandos) ─────────────────────────────────────────────

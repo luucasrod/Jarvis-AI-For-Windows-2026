@@ -9,12 +9,93 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
+import threading
+import time
 import uuid
 
 import paperclip_client as client
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.persistence import Store
+
+
+class PaperclipSession:
+    """Reusable, thread-safe resilience boundary around the existing #18 API.
+
+    Keep one session per Paperclip server in the runtime. All methods share a
+    nonblocking exponential cooldown; they do not sleep, schedule retries, or
+    restart the service. Legacy free functions remain available without this
+    policy for callers that already manage retry timing themselves.
+    """
+
+    def __init__(self, *, config: OrchestratorConfig | None = None,
+                 clock=time.monotonic, max_backoff_seconds: float = 3600):
+        self.config = config or load_config()
+        base = self.config.retry_interval_seconds
+        if (not math.isfinite(base) or base <= 0 or
+                not math.isfinite(max_backoff_seconds) or max_backoff_seconds < base):
+            raise ValueError('backoff must be finite, positive, and capped at or above the base')
+        self._clock = clock
+        self._max_backoff = max_backoff_seconds
+        self._delay = 0.0
+        self._retry_at = 0.0
+        self._lock = threading.RLock()
+        self._process_started_at = None
+        self.last_runtime_status: dict | None = None
+
+    def _call(self, operation):
+        # Serialize this session's requests, including the recovery probe. No
+        # SQLite transaction is held while waiting for the network.
+        with self._lock:
+            remaining = self._retry_at - self._clock()
+            if remaining > 0:
+                return {'available': False, 'reason': 'backoff',
+                        'retry_after_seconds': remaining, 'uncertain': True}
+            result = operation()
+            if result['available']:
+                self._delay = 0.0
+                self._retry_at = 0.0
+            else:
+                delay = min(self._max_backoff, self._delay * 2
+                            if self._delay else self.config.retry_interval_seconds)
+                self._delay = delay
+                self._retry_at = self._clock() + delay
+                result = {**result, 'retry_after_seconds': delay}
+            return result
+
+    def detect_restart(self) -> bool:
+        """True once when two valid health reads identify different processes.
+
+        The first read returns False. Inspect last_runtime_status to distinguish
+        unavailable/unsupported/backoff from a healthy unchanged process.
+        An invalid response never erases the previous valid identity.
+        """
+        def read():
+            info, error = client.get_runtime_info(
+                base_url=self.config.paperclip_base_url,
+                timeout=self.config.paperclip_timeout_seconds)
+            if error:
+                return {'available': False, 'reason': error}
+            current = info['process_started_at']
+            restarted = self._process_started_at is not None and current != self._process_started_at
+            self._process_started_at = current
+            return {'available': True, 'restarted': restarted}
+
+        with self._lock:
+            self.last_runtime_status = self._call(read)
+            return self.last_runtime_status.get('restarted', False)
+
+    def create_task_idempotent(self, company_id: str, title: str, description: str,
+                               correlation_id: str, assignee_agent_id: str | None = None,
+                               *, store: Store | None = None) -> dict:
+        """Invoke #18 once when due; its durable uncertain-write policy remains intact."""
+        return self._call(lambda: create_task_idempotent(
+            company_id, title, description, correlation_id, assignee_agent_id,
+            store=store, config=self.config))
+
+    def get_task_status(self, company_id: str, task_id: str) -> dict:
+        return self._call(lambda: get_task_status(company_id, task_id, config=self.config))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paperclip_creations (
