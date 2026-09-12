@@ -16,6 +16,7 @@ import subprocess
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 from orchestrator.config import OrchestratorConfig, load_config
@@ -37,12 +38,63 @@ CREATE TABLE IF NOT EXISTS pending_github_ops (
 );
 """
 _REPO = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
+_RATE_KEY = 'github:github.com:retry_not_before'
+_HTTP_BLOCK = re.compile(r'HTTP/\d(?:\.\d)? (\d{3})[^\r\n]*\r?\n(?:[A-Za-z0-9-]+:[^\r\n]*\r?\n)*\r?\n')
 
 
 class _Failure(Exception):
-    def __init__(self, reason: str, *, uncertain: bool = False, retryable: bool = True):
+    def __init__(self, reason: str, *, uncertain: bool = False, retryable: bool = True,
+                 retry_at: float | None = None):
         super().__init__(reason)
         self.reason, self.uncertain, self.retryable = reason, uncertain, retryable
+        self.retry_at = retry_at
+
+
+def _response_headers(stdout: str) -> tuple[str, list[tuple[int, dict[str, str]]]]:
+    """Strip gh --include blocks, including those INSIDE a --slurp array.
+
+    JSON strings escape newlines, so HTTP-looking user text cannot be a raw
+    multiline header block. Keep every page's status; partial lists on failure
+    must not masquerade as a complete deduplication result.
+    """
+    headers = []
+    def remove(match):
+        fields = {}
+        for line in match[0].splitlines()[1:]:
+            if ':' in line:
+                name, value = line.split(':', 1)
+                fields[name.lower()] = value.strip()
+        headers.append((int(match[1]), fields))
+        return ''
+    return _HTTP_BLOCK.sub(remove, stdout), headers
+
+
+def _server_retry_at(headers: dict[str, str], now: float) -> float:
+    """Honor every known server floor; the latest applicable restriction wins."""
+    deadlines = []
+    retry_after = headers.get('retry-after', '')
+    if retry_after.isdigit():
+        delay = float(retry_after)
+        if math.isfinite(delay) and delay > 0:
+            deadlines.append(now + delay)
+    elif retry_after:
+        try:
+            instant = parsedate_to_datetime(retry_after)
+            deadline = instant.timestamp() if instant.utcoffset() is not None else 0
+            if math.isfinite(deadline) and deadline > now:
+                deadlines.append(deadline)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    if headers.get('x-ratelimit-remaining') == '0':
+        try:
+            deadline = float(headers.get('x-ratelimit-reset', ''))
+            if math.isfinite(deadline) and deadline > now:
+                deadlines.append(deadline)
+        except ValueError:
+            pass
+    # GitHub recommends at least a minute for secondary limits with no
+    # usable deadline. The operation's exponential backoff may extend this.
+    return max(deadlines) if deadlines else now + 60
 
 
 def _repo(value: str) -> str:
@@ -81,7 +133,16 @@ class GitHubClient:
         return now.astimezone(timezone.utc)
 
     def _api(self, method: str, endpoint: str, payload: dict | None = None, *, paginate=False):
+        now = self._now().timestamp()
+        stored_deadline = self.store.get_sync_value(_RATE_KEY)
+        try:
+            deadline = float(stored_deadline) if stored_deadline is not None else 0
+        except ValueError:
+            deadline = 0
+        if math.isfinite(deadline) and deadline > now:
+            raise _Failure('github_rate_limited', retry_at=deadline)
         args = ['gh', 'api', '--hostname', 'github.com', '--method', method, endpoint]
+        args.append('--include')
         if paginate:
             args.extend(['--paginate', '--slurp'])
         if payload is not None:
@@ -98,19 +159,38 @@ class GitHubClient:
             raise _Failure('timeout', uncertain=method == 'POST') from None
         except OSError:
             raise _Failure('process_unavailable') from None
-        if result.returncode != 0:
+        body, response_headers = _response_headers(result.stdout or '')
+        failed_headers = [(status, fields) for status, fields in response_headers if status >= 400]
+        if result.returncode != 0 or failed_headers:
             stderr = result.stderr or ''
             match = re.search(r'\bHTTP (\d{3})\b', stderr)
-            status = int(match.group(1)) if match else None
+            status = failed_headers[-1][0] if failed_headers else int(match.group(1)) if match else None
+            headers = failed_headers[-1][1] if failed_headers else {}
+            retry_at = None
+            if status == 429 or (status == 403 and ('retry-after' in headers or headers.get('x-ratelimit-remaining') == '0')):
+                retry_at = _server_retry_at(headers, self._now().timestamp())
+                # Shared across operations/client instances using this Store.
+                # A shorter concurrent observation never shortens a cooldown.
+                def record_limit(connection):
+                    row = connection.execute('SELECT value FROM sync_state WHERE key=?', (_RATE_KEY,)).fetchone()
+                    try:
+                        previous = float(row[0]) if row else 0
+                    except (ValueError, TypeError):
+                        previous = 0
+                    value = max(previous, retry_at) if math.isfinite(previous) else retry_at
+                    connection.execute('INSERT INTO sync_state (key,value) VALUES (?,?) '
+                                       'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (_RATE_KEY, str(value)))
+                self.store.run_in_transaction(record_limit)
             not_sent = any(text in stderr.lower() for text in ('no such host', 'connection refused', 'network is unreachable'))
             rejected = status is not None and 400 <= status < 500 and status != 408
             raise _Failure(
                 f'github_http_{status}' if status else 'github_unavailable',
                 uncertain=method == 'POST' and not (not_sent or rejected),
                 retryable=status not in (400, 404, 422),
+                retry_at=retry_at,
             )
         try:
-            return json.loads(result.stdout)
+            return json.loads(body)
         except (ValueError, TypeError):
             raise _Failure('invalid_github_response', uncertain=method == 'POST') from None
 
@@ -139,7 +219,10 @@ class GitHubClient:
         except ValueError:
             return {'available': False, 'reason': 'invalid_list_input'}
         except _Failure as error:
-            return {'available': False, 'reason': error.reason, 'retryable': error.retryable}
+            return {'available': False, 'reason': error.reason, 'retryable': error.retryable,
+                    'retry_at': error.retry_at}
+        except sqlite3.Error:
+            return {'available': False, 'reason': 'local_persistence_error', 'retryable': True}
 
     def _row(self, key: str) -> dict:
         row = self.store.query(
@@ -185,10 +268,11 @@ class GitHubClient:
 
     def _defer(self, key: str, owner: str, error: _Failure, attempts: int) -> dict:
         delay = min(self.max_backoff, self.base_backoff * 2 ** min(attempts - 1, 30))
+        next_attempt = max(self._now().timestamp() + delay, error.retry_at or 0)
         self.store.execute(
             "UPDATE pending_github_ops SET status = ?, next_attempt = ?, reason = ?, uncertain = ? "
             "WHERE operation_key = ? AND owner = ? AND status != 'done'",
-            ('pending' if error.retryable else 'failed', self._now().timestamp() + delay,
+            ('pending' if error.retryable else 'failed', next_attempt,
              error.reason, int(error.uncertain), key, owner),
         )
         return self._result(key)
@@ -245,7 +329,8 @@ class GitHubClient:
                 uncertain = True
             result = self.list_issues(payload['repo'], state='all')
             if not result['available']:
-                raise _Failure(result['reason'], uncertain=uncertain, retryable=result.get('retryable', True))
+                raise _Failure(result['reason'], uncertain=uncertain, retryable=result.get('retryable', True),
+                               retry_at=result.get('retry_at'))
             matches = [item for item in result['issues'] if marker in (item.get('body') or '')]
             matched_marker = bool(matches)
             if not matches and not uncertain:
@@ -290,3 +375,23 @@ class GitHubClient:
             except (sqlite3.Error, ValueError, TypeError, KeyError):
                 results.append({'available': False, 'reason': 'local_persistence_error', 'operation_key': key, 'pending': True})
         return results
+
+    def reprocess_pending_ops(self, limit: int = 20) -> list[dict]:
+        """Startup hook: process due durable operations using the normal leases.
+
+        Never clear rate-limit deadlines, completed rows or uncertain-write
+        markers during restart. A live lease stays owned until it expires.
+        Call again via the periodic retry path for operations not due yet.
+        """
+        return self.retry_pending(limit)
+
+
+def reprocess_pending_ops(store: Store | None = None, *, limit: int = 20, **client_options) -> list[dict]:
+    """Startup entrypoint for #30 without importing/starting the voice monolith."""
+    owned = store is None
+    active_store = store if store is not None else Store()
+    try:
+        return GitHubClient(active_store, **client_options).reprocess_pending_ops(limit)
+    finally:
+        if owned:
+            active_store.close()
