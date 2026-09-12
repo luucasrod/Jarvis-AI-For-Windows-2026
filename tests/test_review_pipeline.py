@@ -157,6 +157,24 @@ def test_second_failure_falls_through_to_opposite_when_fallback_equals_actual_im
     store.close()
 
 
+@pytest.mark.parametrize("implementer", [AgentName.CODEX, AgentName.CLAUDE])
+def test_second_failure_with_either_as_fallback_uses_true_opposite(tmp_path, implementer):
+    # fallback_agent=EITHER is a valid Task/enum value but not a concrete
+    # agent that can actually pick up the retry - request_review itself
+    # rejects EITHER as implementer/reviewer, so it must fall through to
+    # the true opposite exactly like NONE does (Review Task #66, 2nd
+    # revalidation), for either implementer.
+    store = Store(tmp_path / "state.db")
+    reviewer = AgentName.CLAUDE if implementer == AgentName.CODEX else AgentName.CODEX
+    task = _make_task(fallback_agent=AgentName.EITHER)
+
+    request_review(task, implementer, reviewer, passed=False, store=store)
+    result = request_review(task, implementer, reviewer, passed=False, store=store)
+
+    assert result.next_implementer == (AgentName.CLAUDE if implementer == AgentName.CODEX else AgentName.CODEX)
+    store.close()
+
+
 def test_concurrent_failures_do_not_lose_an_increment(tmp_path):
     store = Store(tmp_path / "state.db")
     task = _make_task()
