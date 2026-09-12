@@ -146,6 +146,31 @@ def test_identical_retry_is_idempotent_not_a_duplicate(tmp_path):
     store.close()
 
 
+def test_same_problem_different_options_get_different_refs(tmp_path):
+    # Codex's 2nd-revalidation repro: same problem text, different
+    # options/impact - two genuinely different decisions must not
+    # display the same REF, even though their correlation_ids already
+    # differed (the ref shown to the human was computed from `problem`
+    # alone, ignoring the rest of the question's identity).
+    store = Store(tmp_path / "state.db")
+    task = Task(title="Approve plan", objective="obj", project_id="cashy")
+
+    notify_needs_lucas(
+        task, problem="Approve plan?", why="motivo",
+        options=["Keep", "Upgrade 5"], recommendation="Keep", impact="5/month", store=store,
+    )
+    notify_needs_lucas(
+        task, problem="Approve plan?", why="motivo",
+        options=["Keep", "Upgrade 50"], recommendation="Keep", impact="50/month", store=store,
+    )
+
+    pending = store.get_pending_decisions()
+    assert len(pending) == 2
+    refs = {msg[: msg.index("\n")] for msg in (p["message"] for p in pending)}
+    assert len(refs) == 2
+    store.close()
+
+
 def test_two_pending_decisions_for_same_task_have_distinct_refs_and_correlation_ids(tmp_path):
     store = Store(tmp_path / "state.db")
     task = Task(title="Mudar billing", objective="obj", project_id="cashy")

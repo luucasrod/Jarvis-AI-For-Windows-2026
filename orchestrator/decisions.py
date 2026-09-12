@@ -69,7 +69,14 @@ def format_decision_message(
         f"{_OPTION_LETTERS[i]}) {option}" for i, option in enumerate(options)
     )
 
-    ref = _decision_ref(task, problem)
+    # The ref must be sensitive to every field a human could tell two
+    # decisions apart by, not just `problem` - two questions with the
+    # same problem text but different options/recommendation/impact are
+    # still different decisions and must not display the same REF, even
+    # though their persisted correlation_id (hashed from the full
+    # rendered message in create_pending_decision) already differed
+    # (Review Task #80, 2nd revalidation).
+    ref = _decision_ref(task, "\x1f".join([problem, why, *options, recommendation, impact]))
 
     return (
         f"REF: {ref}\n\n"
