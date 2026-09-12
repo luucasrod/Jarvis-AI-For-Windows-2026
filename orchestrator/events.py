@@ -87,8 +87,13 @@ def emit(
     payload: dict | None = None,
     correlation_id: str | None = None,
     project_id: str | None = None,
+    *,
+    created_at: datetime | None = None,
 ) -> None:
     _ensure_table(store)
+    timestamp = created_at or datetime.now(timezone.utc)
+    if timestamp.utcoffset() is None:
+        raise ValueError("created_at must be timezone-aware")
     store.execute(
         "INSERT INTO events (event_type, payload, correlation_id, project_id, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -97,7 +102,7 @@ def emit(
             json.dumps(payload or {}),
             correlation_id,
             project_id,
-            datetime.now(timezone.utc).isoformat(),
+            timestamp.astimezone(timezone.utc).isoformat(),
         ),
     )
 
