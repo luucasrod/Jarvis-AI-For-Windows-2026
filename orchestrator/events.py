@@ -40,6 +40,7 @@ class EventType(str, Enum):
     DEPLOYMENT_FINISHED = "deployment_finished"
     DECISION_REQUIRED = "decision_required"
     DECISION_RECEIVED = "decision_received"
+    CEO_ESCALATION_REQUIRED = "ceo_escalation_required"
 
 
 def _ensure_table(store: Store) -> None:
