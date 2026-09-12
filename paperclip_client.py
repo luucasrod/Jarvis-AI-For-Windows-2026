@@ -13,6 +13,9 @@ e uma "reason" legível, nunca uma exceção não tratada.
 """
 from __future__ import annotations
 
+import os
+from urllib.parse import quote, urlencode
+
 import requests
 
 try:
@@ -29,21 +32,23 @@ _TIMEOUT = 6.0
 
 
 def _headers() -> dict:
-    if _CONFIG_TOKEN:
-        return {"Authorization": f"Bearer {_CONFIG_TOKEN}"}
+    token = os.environ.get("PAPERCLIP_API_TOKEN") or _CONFIG_TOKEN
+    if token:
+        return {"Authorization": f"Bearer {token}"}
     return {}
 
 
-def _get(path: str):
+def _get(path: str, *, base_url: str | None = None, timeout: float | None = None):
     """GET relativo à API. Devolve (dados, erro) — só um dos dois é not-None."""
     try:
-        r = requests.get(f"{BASE_URL}{path}", headers=_headers(), timeout=_TIMEOUT)
+        r = requests.get(f"{(base_url or BASE_URL).rstrip('/')}{path}", headers=_headers(),
+                         timeout=timeout if timeout is not None else _TIMEOUT)
     except requests.exceptions.ConnectionError:
         return None, "offline"
     except requests.exceptions.Timeout:
         return None, "timeout"
-    except Exception as e:
-        return None, f"erro de rede ({e})"
+    except Exception:
+        return None, "erro de rede"
 
     if r.status_code == 401 or r.status_code == 403:
         return None, "autenticação recusada"
@@ -140,29 +145,26 @@ def is_available() -> bool:
 # — isso fica pra uma fase futura, com guardrails próprios. Toda chamada aqui
 # é feita só depois de confirmação falada do usuário (ver main.py).
 
-def _post(path: str, body: dict | None = None):
+def _post(path: str, body: dict | None = None, *, base_url: str | None = None,
+          timeout: float | None = None):
     try:
         r = requests.post(
-            f"{BASE_URL}{path}",
+            f"{(base_url or BASE_URL).rstrip('/')}{path}",
             json=body or {},
             headers={**_headers(), "Content-Type": "application/json"},
-            timeout=_TIMEOUT,
+            timeout=timeout if timeout is not None else _TIMEOUT,
         )
     except requests.exceptions.ConnectionError:
         return None, "offline"
     except requests.exceptions.Timeout:
         return None, "timeout"
-    except Exception as e:
-        return None, f"erro de rede ({e})"
+    except Exception:
+        return None, "erro de rede"
 
     if r.status_code in (401, 403):
         return None, "autenticação recusada"
     if r.status_code >= 400:
-        try:
-            detail = r.json().get("error", r.text[:200])
-        except Exception:
-            detail = r.text[:200]
-        return None, f"Paperclip recusou ({r.status_code}: {detail})"
+        return None, f"Paperclip recusou ({r.status_code})"
 
     try:
         return (r.json() if r.text else {}), None
@@ -206,8 +208,42 @@ def resume_agent(agent_id: str):
     return _post(f"/api/agents/{agent_id}/resume")
 
 
-def create_task(company_id: str, title: str, description: str = "", assignee_agent_id: str | None = None):
+def create_task(company_id: str, title: str, description: str = "", assignee_agent_id: str | None = None,
+                *, base_url: str | None = None, timeout: float | None = None):
     body = {"title": title, "description": description, "priority": "medium"}
     if assignee_agent_id:
         body["assigneeAgentId"] = assignee_agent_id
-    return _post(f"/api/companies/{company_id}/issues", body)
+    return _post(f"/api/companies/{quote(company_id, safe='')}/issues", body,
+                 base_url=base_url, timeout=timeout)
+
+
+def list_company_tasks(company_id: str, *, query: str | None = None,
+                       base_url: str | None = None, timeout: float | None = None):
+    """Read company issues through the existing transport, with bounded paging.
+
+    Returns (list, error). An incomplete/repeated page is an error rather than
+    proof that an issue does not exist. Used for idempotency reconciliation.
+    """
+    collected, seen = [], set()
+    for page in range(50):
+        params = {"limit": 100, "offset": page * 100}
+        if query:
+            params["q"] = query
+        data, error = _get(
+            f"/api/companies/{quote(company_id, safe='')}/issues?{urlencode(params)}",
+            base_url=base_url, timeout=timeout,
+        )
+        if error:
+            return None, error
+        if not isinstance(data, list):
+            return None, "invalid_task_list"
+        for item in data:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+                return None, "invalid_task_list"
+            if item["id"] in seen:
+                return None, "incomplete_task_list"
+            seen.add(item["id"])
+            collected.append(item)
+        if len(data) < 100:
+            return collected, None
+    return None, "incomplete_task_list"
