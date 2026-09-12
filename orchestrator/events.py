@@ -45,6 +45,7 @@ class EventType(str, Enum):
     # de controle vira um evento telegram_message_received").
     TELEGRAM_MESSAGE_RECEIVED = "telegram_message_received"
     CEO_ESCALATION_REQUIRED = "ceo_escalation_required"
+    MERGE_COMPLETED = "merge_completed"
 
 
 def _ensure_table(store: Store) -> None:
