@@ -7,6 +7,7 @@ sounddevice
 soundfile
 numpy
 requests
+tzdata
 
 # dev/test
 pytest

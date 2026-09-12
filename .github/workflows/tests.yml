@@ -21,6 +21,6 @@ jobs:
           # ubuntu-latest doesn't have out of the box and would make CI
           # flaky/slow for something orchestrator/ doesn't even use.
           # Add here only what orchestrator/ actually imports.
-          pip install pytest pytest-mock requests
+          pip install pytest pytest-mock requests tzdata
       - name: Run tests
         run: pytest

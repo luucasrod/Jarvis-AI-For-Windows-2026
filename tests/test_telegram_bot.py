@@ -158,3 +158,84 @@ def test_receive_control_updates_offset_advances_for_next_call(tmp_path):
     receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=99)
     assert seen_params[0]["offset"] == 100
     store.close()
+
+
+# --- Regression tests from Codex's review (Review Task #70, PR #69) -------
+# receive_control_updates promised never to propagate a Telegram failure,
+# but only validated JSON decoding - a malformed-but-valid-JSON payload
+# used to raise AttributeError deep in the loop and lose the polling
+# cursor for every update after the bad one.
+
+class _RawJsonResponse:
+    """Like _FakeResponse, but returns exactly what's given - including
+    None - instead of _FakeResponse's `json_data or {}` normalization."""
+
+    def __init__(self, status_code, json_value):
+        self.status_code = status_code
+        self._json_value = json_value
+
+    def json(self):
+        return self._json_value
+
+
+def test_receive_control_updates_survives_null_payload(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _RawJsonResponse(200, None)
+
+    result = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=10)
+    assert result == 10
+    store.close()
+
+
+def test_receive_control_updates_survives_empty_list_result(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _RawJsonResponse(200, {"result": []})
+
+    result = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=10)
+    assert result == 10
+    store.close()
+
+
+def test_receive_control_updates_survives_null_entry_in_result(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _RawJsonResponse(200, {"result": [None]})
+
+    result = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=10)
+    assert result == 10
+    assert query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED]) == []
+    store.close()
+
+
+def test_receive_control_updates_survives_null_chat_and_advances_cursor(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _RawJsonResponse(
+            200, {"result": [{"update_id": 11, "message": {"chat": None}}]}
+        )
+
+    result = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=10)
+    # A malformed update must not emit an event, but the cursor still
+    # advances past it (the update_id is trustworthy even if its
+    # payload isn't) so the next poll doesn't refetch it forever.
+    assert result == 11
+    assert query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED]) == []
+    store.close()
+
+
+def test_send_message_error_never_leaks_url_or_token():
+    import requests
+
+    def fake_post(url, json, timeout):
+        raise requests.exceptions.InvalidURL(f"Invalid URL: {url}")
+
+    ok, error = send_control_message("oi", config=_CONFIGURED, post_fn=fake_post)
+    assert ok is False
+    assert "fake-token" not in error
+    assert "http" not in error.lower()

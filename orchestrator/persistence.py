@@ -21,7 +21,6 @@ from typing import TypeVar
 from orchestrator.models import Task, TaskState
 
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "orchestrator_state.db"
-
 _T = TypeVar("_T")
 
 _SCHEMA = """
@@ -97,6 +96,16 @@ class Store:
     def query(self, sql: str, params: tuple = ()) -> list[tuple]:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
+
+    def execute_returning(self, sql: str, params: tuple = ()) -> list[tuple]:
+        """Like execute(), but returns the statement's own RETURNING rows
+        from the SAME lock scope - execute()+query() as two separate calls
+        would release the lock in between, leaving a read-modify-write
+        (e.g. an increment) racy across threads (#29, Review Task #66)."""
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            self._conn.commit()
+            return rows
 
     # --- tasks -------------------------------------------------------
 
@@ -216,6 +225,22 @@ class Store:
                 self._conn.rollback()
                 raise
 
+    def run_sync_once(
+        self, key: str, value: str, operation: Callable[[sqlite3.Connection], None]
+    ) -> bool:
+        """Commit an action and its sync guard together, or neither on failure.
+
+        Use a distinct key per occurrence (scheduler includes the local date).
+        Callback restrictions are the same as run_in_transaction.
+        """
+        def apply(connection: sqlite3.Connection) -> bool:
+            if connection.execute("SELECT 1 FROM sync_state WHERE key = ?", (key,)).fetchone():
+                return False
+            operation(connection)
+            connection.execute("INSERT INTO sync_state (key, value) VALUES (?, ?)", (key, value))
+            return True
+
+        return self.run_in_transaction(apply)
 
     def set_sync_value(self, key: str, value: str) -> None:
         with self._lock:
