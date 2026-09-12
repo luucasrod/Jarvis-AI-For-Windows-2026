@@ -44,6 +44,7 @@ class EventType(str, Enum):
     # list but required by #19's own scope ("mensagem recebida no canal
     # de controle vira um evento telegram_message_received").
     TELEGRAM_MESSAGE_RECEIVED = "telegram_message_received"
+    CEO_ESCALATION_REQUIRED = "ceo_escalation_required"
 
 
 def _ensure_table(store: Store) -> None:

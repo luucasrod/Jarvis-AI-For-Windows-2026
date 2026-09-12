@@ -94,6 +94,16 @@ class Store:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
+    def execute_returning(self, sql: str, params: tuple = ()) -> list[tuple]:
+        """Like execute(), but returns the statement's own RETURNING rows
+        from the SAME lock scope - execute()+query() as two separate calls
+        would release the lock in between, leaving a read-modify-write
+        (e.g. an increment) racy across threads (#29, Review Task #66)."""
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            self._conn.commit()
+            return rows
+
     # --- tasks -------------------------------------------------------
 
     def save_task(self, task: Task) -> None:
