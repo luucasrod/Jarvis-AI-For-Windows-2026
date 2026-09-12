@@ -1,9 +1,10 @@
-﻿"""Daily scheduling with an injectable, timezone-aware clock (#25).
+"""Daily scheduling with an injectable, timezone-aware clock (#25).
 
 The runtime calls check_and_fire periodically and admit_task after planning.
 No thread starts at import, no report content or CEO wakeup is implemented.
 Missed ticks catch up only for today; a cycle missed past cutoff is recorded
-without promoting tasks. Pending dependencies become BLOCKED for #28 to track.
+without promoting tasks. Pending dependencies keep their queued state so #28
+can reconsider them without clearing an explicit planner/human blocker.
 """
 from __future__ import annotations
 
@@ -98,7 +99,9 @@ class Scheduler:
             ).fetchall()
             for row in rows:
                 task = Task.from_dict(json.loads(row[0]))
-                task.state = TaskState.READY if _dependencies_done(connection, task) else TaskState.BLOCKED
+                if not _dependencies_done(connection, task):
+                    continue
+                task.state = TaskState.READY
                 task.updated_at = now.astimezone(timezone.utc)
                 _save_task(connection, task)
                 if task.state == TaskState.READY:
@@ -136,7 +139,8 @@ class Scheduler:
         Existing tasks beyond PLANNED and human/security blockers are preserved.
         The returned copy is the persisted task; the input is not mutated.
         Before cycle start or at/after cutoff, PLANNED becomes NEXT_CYCLE.
-        During the window it becomes READY only when all dependencies are DONE.
+        During the window it becomes READY only when all dependencies are DONE;
+        otherwise it stays PLANNED for dependency reconsideration (#28).
         """
         now = self._now()
 
@@ -147,7 +151,7 @@ class Scheduler:
                 if not self._open(now, connection):
                     stored.state = TaskState.NEXT_CYCLE
                 else:
-                    stored.state = TaskState.READY if _dependencies_done(connection, stored) else TaskState.BLOCKED
+                    stored.state = TaskState.READY if _dependencies_done(connection, stored) else TaskState.PLANNED
                 stored.updated_at = now.astimezone(timezone.utc)
                 _save_task(connection, stored)
                 if stored.state == TaskState.READY:

@@ -1,4 +1,4 @@
-﻿"""Scheduler acceptance, restart, transaction and Lisbon DST tests (#25)."""
+"""Scheduler acceptance, restart, transaction and Lisbon DST tests (#25)."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Barrier
@@ -117,9 +117,9 @@ def test_dependency_checks_and_unlimited_cycle(store):
     scheduler.check_and_fire()
     assert len(store.list_tasks(TaskState.READY)) == 80
     for item in [missing, waiting, self_ref, cycle_a, cycle_b]:
-        assert store.get_task(item.id).state == TaskState.BLOCKED
+        assert store.get_task(item.id).state == TaskState.NEXT_CYCLE
     assert len(query_events(store, event_types=[EventType.TASK_READY])) == 80
-    assert scheduler.admit_task(task(dependencies=['missing'])).state == TaskState.BLOCKED
+    assert scheduler.admit_task(task(dependencies=['missing'])).state == TaskState.PLANNED
 
 
 @pytest.mark.parametrize('state', [TaskState.BLOCKED, TaskState.NEEDS_LUCAS])
@@ -247,3 +247,15 @@ def test_concurrent_schedulers_across_connections_fire_once(tmp_path):
     finally:
         for instance in stores:
             instance.close()
+
+
+def test_dependency_completion_allows_readmission_without_clearing_blockers(store):
+    scheduler = Scheduler(store, Clock('2026-09-12T09:00:00'))
+    dependency = task(TaskState.IN_PROGRESS)
+    store.save_task(dependency)
+    waiting = task(dependencies=[dependency.id])
+    assert scheduler.admit_task(waiting).state == TaskState.PLANNED
+    dependency.state = TaskState.DONE
+    store.save_task(dependency)
+    assert scheduler.admit_task(waiting).state == TaskState.READY
+    assert len(query_events(store, event_types=[EventType.TASK_READY])) == 1
