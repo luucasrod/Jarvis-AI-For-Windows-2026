@@ -108,3 +108,35 @@ def test_since_naive_datetime_is_treated_as_utc(tmp_path):
     naive_past = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None)
     assert len(query_events(store, since=naive_past)) == 1
     store.close()
+
+
+# --- created_at override (needed by #27's idle-detection tests) -----------
+
+def test_emit_accepts_explicit_created_at(tmp_path):
+    store = Store(tmp_path / "state.db")
+    explicit = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    emit(store, EventType.TASK_CREATED, {}, created_at=explicit)
+
+    assert query_events(store)[0]["created_at"] == explicit
+    store.close()
+
+
+def test_emit_normalizes_explicit_created_at_to_utc(tmp_path):
+    store = Store(tmp_path / "state.db")
+    lisbon_summer = datetime(2026, 6, 1, 13, 0, tzinfo=timezone(timedelta(hours=1)))
+
+    emit(store, EventType.TASK_CREATED, {}, created_at=lisbon_summer)
+
+    assert query_events(store)[0]["created_at"] == lisbon_summer.astimezone(timezone.utc)
+    store.close()
+
+
+def test_emit_rejects_naive_created_at(tmp_path):
+    store = Store(tmp_path / "state.db")
+    try:
+        emit(store, EventType.TASK_CREATED, {}, created_at=datetime(2026, 1, 1))
+        assert False, "expected ValueError"
+    except ValueError as error:
+        assert "timezone-aware" in str(error)
+    store.close()
