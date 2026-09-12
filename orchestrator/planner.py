@@ -177,10 +177,10 @@ def _parse_decomposition(raw_json: str, project_id: str | None) -> list[Task]:
     invalid item is skipped, shifting every subsequent index).
 
     Malformed `depends_on_index` (wrong type, non-int/bool entries,
-    self-references, out-of-range indices) are ignored individually
-    rather than crashing the whole decomposition - a bad dependency
-    reference from the LLM should degrade to "no dependency", not take
-    down the planner.
+    self-references, out-of-range indices) never crash the decomposition,
+    but they also never degrade to "no dependency" - a reference that
+    can't be trusted or resolved leaves the task BLOCKED instead of
+    looking immediately releasable.
     """
     try:
         items = json.loads(raw_json)
@@ -223,24 +223,28 @@ def _parse_decomposition(raw_json: str, project_id: str | None) -> list[Task]:
             continue
 
         raw_indices = item.get("depends_on_index")
+        dependencies = []
+        has_unresolved_reference = False
         if raw_indices is None:
             raw_indices = []
         elif not isinstance(raw_indices, list):
-            # Malformed depends_on_index (wrong type entirely) - can't
-            # trust ANY of it, so treat as "no dependency declared" the
-            # same way an omitted field would be. This is different from
-            # an index that IS a list but references something invalid
-            # (handled below as an unresolved reference, not a no-op).
+            # Malformed depends_on_index (wrong type entirely, e.g. a bare
+            # int) - unlike an omitted field, this IS a declared dependency
+            # we can't resolve, so it must not look like "no dependency"
+            # (review #62, 3rd pass).
             raw_indices = []
+            has_unresolved_reference = True
 
-        dependencies = []
-        has_unresolved_reference = False
         for i in raw_indices:
             if isinstance(i, bool) or not isinstance(i, int):
                 has_unresolved_reference = True
                 continue
             if i == original_index:
-                continue  # self-dependency is simply redundant, not an error
+                # Self-reference is a cycle of size 1, not a satisfied (or
+                # absent) dependency - it must never be dropped silently
+                # (review #62, 3rd pass).
+                has_unresolved_reference = True
+                continue
             dep_task = index_to_task.get(i)
             if dep_task is not None:
                 dependencies.append(dep_task.id)

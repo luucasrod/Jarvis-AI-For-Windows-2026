@@ -179,12 +179,16 @@ def test_original_dependency_indices_survive_filtering():
     assert task_b.dependencies == [task_a.id]
 
 
-def test_wrong_type_dependency_does_not_crash():
+def test_wrong_type_for_whole_depends_on_index_field_blocks_task():
+    # depends_on_index itself is a bare int, not a list - unlike an
+    # omitted field, this IS a declared dependency we can't trust, so it
+    # must not resolve as "no dependency" (review #62, 3rd pass).
     from orchestrator.planner import _parse_decomposition
 
     tasks = _parse_decomposition('[{"title":"A","depends_on_index":1}]', "cashy")
     assert isinstance(tasks, list)
     assert tasks[0].dependencies == []
+    assert tasks[0].state == TaskState.BLOCKED
 
 
 def test_bool_in_depends_on_index_is_ignored_not_treated_as_int():
@@ -318,16 +322,54 @@ def test_simple_cycle_between_two_tasks_is_flagged_blocked():
     assert all(t.state == TaskState.BLOCKED for t in tasks)
 
 
-def test_self_dependency_alone_is_not_treated_as_a_cycle():
+def test_self_dependency_alone_is_a_cycle_of_size_one_and_blocks():
+    # A task depending on itself can never become unblocked - it must be
+    # flagged the same way a 2-node cycle is, not silently dropped as
+    # redundant (review #62, 3rd pass).
     from orchestrator.planner import _parse_decomposition
 
-    # self-reference is stripped as redundant, not an error/cycle
     tasks = _parse_decomposition(
         json.dumps([{"title": "A", "depends_on_index": [0]}]),
         "cashy",
     )
     assert tasks[0].dependencies == []
-    assert tasks[0].state == TaskState.PLANNED
+    assert tasks[0].state == TaskState.BLOCKED
+
+
+# --- Regression tests from Codex's 3rd review pass on #62 (PR #61) --------
+# Same two gaps as above, reproduced through the public plan() entry point
+# (not just the internal _parse_decomposition helper) per Codex's request.
+
+def test_plan_blocks_task_when_depends_on_index_field_has_wrong_type():
+    decompose_json = json.dumps([
+        {"title": "Publish report", "objective": "publica", "depends_on_index": 1},
+    ])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan(
+        "Gera e publica um relatorio no Cashy",
+        resolver=_FakeResolver(_SAMPLE_PROJECT),
+        llm_generate=llm,
+    )
+
+    assert result.tasks[0].dependencies == []
+    assert result.tasks[0].state == TaskState.BLOCKED
+
+
+def test_plan_blocks_task_with_self_reference_in_depends_on_index():
+    decompose_json = json.dumps([
+        {"title": "Publish report", "objective": "publica", "depends_on_index": [0]},
+    ])
+    llm = _fake_llm_sequence("plano", "critica", decompose_json)
+
+    result = plan(
+        "Gera e publica um relatorio no Cashy",
+        resolver=_FakeResolver(_SAMPLE_PROJECT),
+        llm_generate=llm,
+    )
+
+    assert result.tasks[0].dependencies == []
+    assert result.tasks[0].state == TaskState.BLOCKED
 
 
 def test_flag_dependency_cycles_runs_again_after_dedup_style_remap():
