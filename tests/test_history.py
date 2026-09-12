@@ -70,6 +70,38 @@ def test_decision_still_pending_when_only_requested(tmp_path):
     store.close()
 
 
+def test_task_blocked_without_decision_is_counted_historically(tmp_path):
+    # A task can be genuinely stuck (dependency/cycle) without any
+    # DECISION_REQUIRED ever firing - tasks_blocked must not depend on
+    # the decisions machinery at all (Review Task #68, 2nd revalidation).
+    store = Store(tmp_path / "state.db")
+    emit(store, EventType.TASK_BLOCKED, {}, project_id="cashy")
+
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    summary = diff_since(store, since)
+
+    assert summary.tasks_blocked == 1
+    assert summary.decisions_pending == 0
+    assert "1 tarefa(s) entraram em bloqueio no periodo" in summarize_for_voice(summary)
+    store.close()
+
+
+def test_task_blocked_then_completed_in_window_still_counts_historically(tmp_path):
+    # tasks_blocked is a historical "entered blocked state" count, not a
+    # claim about current state - a block followed by completion in the
+    # same window still counts (Review Task #68, 2nd revalidation).
+    store = Store(tmp_path / "state.db")
+    emit(store, EventType.TASK_BLOCKED, {}, project_id="cashy")
+    emit(store, EventType.TASK_COMPLETED, {}, project_id="cashy")
+
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    summary = diff_since(store, since)
+
+    assert summary.tasks_blocked == 1
+    assert summary.tasks_completed == 1
+    store.close()
+
+
 def test_merge_completed_is_counted_and_reported():
     from orchestrator.history import HistorySummary
 
