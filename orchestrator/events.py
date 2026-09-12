@@ -48,6 +48,7 @@ class EventType(str, Enum):
     REPORT_TIME_REACHED = "report_time_reached"
     CEO_ESCALATION_REQUIRED = "ceo_escalation_required"
     MERGE_COMPLETED = "merge_completed"
+    TASK_BLOCKED = "task_blocked"
 
 
 def _ensure_table(store: Store) -> None:

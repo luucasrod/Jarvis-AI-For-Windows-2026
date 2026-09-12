@@ -23,6 +23,7 @@ _COUNTED_EVENT_TYPES = (
     EventType.DECISION_REQUIRED,
     EventType.DECISION_RECEIVED,
     EventType.MERGE_COMPLETED,
+    EventType.TASK_BLOCKED,
 )
 
 
@@ -32,6 +33,7 @@ class HistorySummary:
     tasks_created: int = 0
     tasks_completed: int = 0
     decisions_pending: int = 0
+    tasks_blocked: int = 0
     reviews_passed: int = 0
     reviews_failed: int = 0
     bugs_found: int = 0
@@ -47,10 +49,17 @@ def diff_since(store: Store, since: datetime) -> HistorySummary:
     (also in the window) - a decision that was asked AND answered within
     the same period must not be reported as currently awaiting a
     response (Review Task #68). This is deliberately about decisions
-    specifically, not a general notion of "blocked": #14's event log has
-    no dedicated BLOCKED event, and a task can be genuinely stuck
-    (dependency/cycle) without ever generating a DECISION_REQUIRED - this
-    module has no signal for that case and does not claim to.
+    specifically, not a general notion of "blocked".
+
+    `tasks_blocked` is a SEPARATE, purely historical count of
+    EventType.TASK_BLOCKED occurrences in the window ("N tasks entered a
+    blocked state during this period") - it does NOT claim those tasks
+    are still blocked now (a block followed by completion in the same
+    window still counts here), and it is not tied to DECISION_REQUIRED at
+    all, since a task can be genuinely stuck (dependency/cycle) without
+    ever generating one (Review Task #68, 2nd revalidation). Emitting
+    TASK_BLOCKED from the actual state-transition code stays out of this
+    issue's scope, same as MERGE_COMPLETED.
     """
     events = query_events(store, since=since, event_types=list(_COUNTED_EVENT_TYPES))
     summary = HistorySummary(since=since, total_events=len(events))
@@ -78,6 +87,8 @@ def diff_since(store: Store, since: datetime) -> HistorySummary:
             summary.deployments_finished += 1
         elif event_type == EventType.MERGE_COMPLETED:
             summary.merges_completed += 1
+        elif event_type == EventType.TASK_BLOCKED:
+            summary.tasks_blocked += 1
         elif event_type == EventType.DECISION_REQUIRED:
             if correlation_id:
                 pending_decision_correlations.add(correlation_id)
@@ -100,6 +111,8 @@ def summarize_for_voice(summary: HistorySummary) -> str:
         parts.append(f"{summary.tasks_completed} concluida(s)")
     if summary.decisions_pending:
         parts.append(f"{summary.decisions_pending} decisao(oes) pendente(s)")
+    if summary.tasks_blocked:
+        parts.append(f"{summary.tasks_blocked} tarefa(s) entraram em bloqueio no periodo")
     if summary.reviews_passed:
         parts.append(f"{summary.reviews_passed} revisao(oes) aprovada(s)")
     if summary.reviews_failed:
