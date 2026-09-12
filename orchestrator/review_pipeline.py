@@ -100,9 +100,10 @@ def request_review(
     feedback: str = "",
 ) -> ReviewResult:
     """Processes the verdict of an already-performed independent review
-    (reviewer must differ from implementer - enforced by #24's
-    classify_task upstream, not re-checked here) and decides the next
-    transition per the 3-failure escalation policy.
+    (reviewer must differ from implementer - #24's classify_task only
+    RECOMMENDS this upstream; this function validates the concrete
+    implementer/reviewer it actually receives, see below) and decides
+    the next transition per the 3-failure escalation policy.
 
     `passed` is supplied by the caller (a human, or another agent
     session's judgement) - this function's own job is purely the state
@@ -173,10 +174,14 @@ def request_review(
         # for failure #1) - the rule is "switch agent/approach", so a
         # fallback that matches who's actually implementing right now is
         # not a real switch and must fall through to the true opposite
-        # (#29, Review Task #66).
+        # (#29, Review Task #66). Only CLAUDE/CODEX count as a concrete
+        # fallback - EITHER isn't an agent that can actually pick this up
+        # (request_review itself rejects it as implementer/reviewer), so
+        # it must fall through to the opposite too, same as NONE
+        # (Review Task #66, 2nd revalidation).
         next_agent = (
             task.fallback_agent
-            if task.fallback_agent not in (AgentName.NONE, implementer)
+            if task.fallback_agent in (AgentName.CLAUDE, AgentName.CODEX) and task.fallback_agent != implementer
             else _opposite_agent(implementer)
         )
         return ReviewResult(
