@@ -14,11 +14,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from orchestrator.models import Task, TaskState
 
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "orchestrator_state.db"
+
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -192,6 +196,26 @@ class Store:
             self._conn.commit()
 
     # --- sync state ------------------------------------------------------
+
+    def run_in_transaction(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
+        """Run local SQL effects atomically, including across Store instances.
+
+        The callback uses only the supplied connection; it must not commit,
+        call other Store methods, use executescript, or perform network I/O.
+        Existing Store methods retain their commit-per-call behavior.
+        """
+        with self._lock:
+            if self._conn.in_transaction:
+                raise RuntimeError("Nested Store transactions are not supported")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = operation(self._conn)
+                self._conn.commit()
+                return result
+            except BaseException:
+                self._conn.rollback()
+                raise
+
 
     def set_sync_value(self, key: str, value: str) -> None:
         with self._lock:
