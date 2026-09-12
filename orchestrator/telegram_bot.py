@@ -59,8 +59,13 @@ def _send_message(
         return False, "offline"
     except requests.exceptions.Timeout:
         return False, "timeout"
-    except Exception as exc:  # never let a Telegram hiccup crash Jarvis
-        return False, f"erro de rede ({exc})"
+    except Exception:  # never let a Telegram hiccup crash Jarvis
+        # Never surface str(exc) here - requests embeds the full request
+        # URL (which contains the bot token, e.g. InvalidURL) in several
+        # of its exception messages, so anything more specific than a
+        # generic label risks leaking the token into logs/UI (Review
+        # Task #70).
+        return False, "erro de rede"
 
     if response.status_code == 401:
         return False, "token invalido"
@@ -125,16 +130,34 @@ def receive_control_updates(
     except ValueError:
         return last_update_id
 
-    results = payload.get("result") or []
+    if not isinstance(payload, dict):
+        return last_update_id
+
+    results = payload.get("result")
+    if not isinstance(results, list):
+        results = []
     new_last_update_id = last_update_id
 
     for update in results:
+        # Telegram's own API contract guarantees objects here, but a
+        # malformed/proxied response (null entries, null chat, etc.) must
+        # degrade to "skip this update" rather than crash the whole poll
+        # and lose the cursor for every update after it (Review Task #70).
+        if not isinstance(update, dict):
+            continue
+
         update_id = update.get("update_id")
         if update_id is not None:
             new_last_update_id = update_id
 
-        message = update.get("message") or {}
-        chat_id = str(message.get("chat", {}).get("id", ""))
+        message = update.get("message")
+        if not isinstance(message, dict):
+            continue
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            continue
+
+        chat_id = str(chat.get("id", ""))
         if chat_id != str(config.telegram_control_chat_id):
             continue
 
