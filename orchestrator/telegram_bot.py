@@ -24,6 +24,7 @@ message content is #26's job.
 """
 from __future__ import annotations
 
+import sqlite3
 from typing import Callable
 
 import requests
@@ -76,21 +77,43 @@ def _send_message(
     if response.status_code >= 400:
         return False, f"resposta inesperada ({response.status_code})"
 
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return False, 'resposta invalida do Telegram'
+    if not isinstance(payload, dict) or payload.get('ok') is not True or not isinstance(payload.get('result'), dict):
+        return False, 'envio nao confirmado pelo Telegram'
     return True, None
 
 
+def _record_delivery(store, config, channel, result):
+    if store is not None:
+        from orchestrator.healthcheck import record_telegram_delivery
+        try:
+            record_telegram_delivery(store, config, channel, result[0])
+        except sqlite3.Error:
+            # A diagnostic write failure must not turn a confirmed send into
+            # a retryable delivery failure (and duplicate the user's message).
+            pass
+    return result
+
+
 def send_control_message(
-    text: str, config: OrchestratorConfig | None = None, post_fn: Callable | None = None
+    text: str, config: OrchestratorConfig | None = None, post_fn: Callable | None = None,
+    *, store: Store | None = None,
 ) -> tuple[bool, str | None]:
     config = config or load_config()
-    return _send_message(config.telegram_control_chat_id, text, config, post_fn)
+    return _record_delivery(store, config, 'control',
+                            _send_message(config.telegram_control_chat_id, text, config, post_fn))
 
 
 def send_report_message(
-    text: str, config: OrchestratorConfig | None = None, post_fn: Callable | None = None
+    text: str, config: OrchestratorConfig | None = None, post_fn: Callable | None = None,
+    *, store: Store | None = None,
 ) -> tuple[bool, str | None]:
     config = config or load_config()
-    return _send_message(config.telegram_report_chat_id, text, config, post_fn)
+    return _record_delivery(store, config, 'report',
+                            _send_message(config.telegram_report_chat_id, text, config, post_fn))
 
 
 def receive_control_updates(

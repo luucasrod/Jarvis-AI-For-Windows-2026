@@ -18,7 +18,7 @@ _UNCONFIGURED = OrchestratorConfig()
 class _FakeResponse:
     def __init__(self, status_code=200, json_data=None):
         self.status_code = status_code
-        self._json_data = json_data or {}
+        self._json_data = json_data if json_data is not None else {'ok': True, 'result': {'message_id': 1}}
 
     def json(self):
         return self._json_data

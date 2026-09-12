@@ -134,10 +134,10 @@ def get_snapshot() -> dict:
     return {"available": True, "companies": result}
 
 
-def is_available() -> bool:
+def is_available(*, base_url: str | None = None, timeout: float | None = None) -> bool:
     """Checagem rápida (usada pra decidir se vale a pena tentar o relatório)."""
-    _, err = _get("/api/health")
-    return err is None
+    data, err = _get("/api/health", base_url=base_url, timeout=timeout)
+    return err is None and isinstance(data, dict) and data.get('status') == 'ok'
 
 
 def get_runtime_info(*, base_url: str | None = None, timeout: float | None = None):
