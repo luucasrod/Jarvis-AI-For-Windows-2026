@@ -179,12 +179,47 @@ def test_mark_rate_limited_rejects_non_concrete_agent(tmp_path):
 
 # --- Regressions from Codex's review (Review Task #109) -------------------
 
-def test_concurrent_redirect_and_task_start_never_corrupts_state(tmp_path):
+def test_task_started_by_another_connection_before_redirect_is_never_reverted(tmp_path):
     # Finding #1: the old code read READY tasks and redirected them as two
-    # separate Store calls - a task started (READY -> IN_PROGRESS) by
-    # another connection in between got silently reverted back towards
-    # the stale READY snapshot. Whichever operation's transaction commits
-    # first must win cleanly; the other must see the up-to-date state.
+    # separate Store calls (store.list_tasks(READY) then store.save_task).
+    # If another connection had ALREADY started one of those tasks
+    # (READY -> IN_PROGRESS) by the time the redirect ran, the redirect's
+    # write - built from its now-stale in-memory snapshot, whose OWN
+    # `state` field still read READY - would overwrite the row's `state`
+    # column back to READY via save_task's unconditional
+    # `state=excluded.state`, erasing the real IN_PROGRESS transition.
+    # This reproduces that ordering directly and deterministically (no
+    # thread-timing dependency): the fix's SELECT runs fresh INSIDE
+    # mark_rate_limited's own transaction, so it must see IN_PROGRESS and
+    # never touch this task's row at all.
+    path = tmp_path / "state.db"
+    task = _flex_task(preferred_agent=AgentName.CLAUDE)
+    other_connection = Store(path)
+    other_connection.save_task(task)
+
+    started = other_connection.get_task(task.id)
+    started.state = TaskState.IN_PROGRESS
+    other_connection.save_task(started)
+    other_connection.close()
+
+    store = Store(path)
+    mark_rate_limited(store, AgentName.CLAUDE, "usage limit")
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.state == TaskState.IN_PROGRESS
+    assert reloaded.preferred_agent == AgentName.CLAUDE
+    store.close()
+
+
+def test_concurrent_redirect_and_task_start_never_deadlocks_or_corrupts(tmp_path):
+    # A genuine cross-connection concurrency run (BEGIN IMMEDIATE
+    # serializes the two writers - same pattern as #17's
+    # test_concurrent_connections_create_one_issue): whichever operation's
+    # transaction commits first is a legitimate outcome either way, so
+    # this only asserts the invariants that must ALWAYS hold regardless
+    # of ordering - no exception/deadlock, the task always ends up
+    # IN_PROGRESS (start_task always runs), and preferred_agent is
+    # whichever concrete agent is consistent with that ordering.
     path = tmp_path / "state.db"
     task = _flex_task(preferred_agent=AgentName.CLAUDE)
     setup_store = Store(path)
@@ -215,13 +250,8 @@ def test_concurrent_redirect_and_task_start_never_corrupts_state(tmp_path):
             list(pool.map(lambda fn: fn(), [redirect, start_task]))
 
         final = store_a.get_task(task.id)
-        # Whichever transaction committed first, the result must be
-        # internally consistent - never an IN_PROGRESS task whose
-        # executor got silently swapped out from under it.
-        if final.state == TaskState.IN_PROGRESS:
-            assert final.preferred_agent == AgentName.CLAUDE
-        else:
-            assert final.state == TaskState.READY
+        assert final.state == TaskState.IN_PROGRESS
+        assert final.preferred_agent in (AgentName.CLAUDE, AgentName.CODEX)
     finally:
         store_a.close()
         store_b.close()
