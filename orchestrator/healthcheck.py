@@ -11,7 +11,7 @@ from collections.abc import Callable
 import paperclip_client as client
 from orchestrator.agent_availability import is_agent_available
 from orchestrator.audit import record as audit_record
-from orchestrator.events import EventType, emit, query_events
+from orchestrator.events import EventType, emit_in_transaction, query_events
 from orchestrator.models import AgentName, TaskState
 from orchestrator.task_queue import get_promotable_tasks
 from datetime import datetime, timezone
@@ -257,6 +257,7 @@ def format_health_for_telegram(report: HealthReport) -> str:
 
 
 # Idle diagnosis from issue #27; preserved during integration with #36.
+# Fixed per Codex's review (Review Task #113, 4 findings) - see check_idle.
 _ACTIVITY_EVENTS = [EventType.TASK_STARTED, EventType.TASK_COMPLETED]
 
 
@@ -280,6 +281,22 @@ def _last_activity_at(store: Store) -> datetime | None:
     return events[-1]["created_at"] if events else None
 
 
+def _paused_agents(snapshot: dict) -> list[str]:
+    """Agents with a recorded pause_reason in Paperclip's own snapshot
+    (#11) - a stronger signal than guessing at the exact `status` string
+    vocabulary. Returns [] on any unavailable/malformed snapshot rather
+    than raising (get_snapshot() itself never raises, but its shape is
+    still untrusted input)."""
+    if not isinstance(snapshot, dict) or not snapshot.get("available"):
+        return []
+    names = []
+    for company in snapshot.get("companies") or []:
+        for agent in (company or {}).get("agents") or []:
+            if isinstance(agent, dict) and agent.get("pause_reason"):
+                names.append(agent.get("name") or "desconhecido")
+    return names
+
+
 def _record(store: Store, diagnosis: IdleDiagnosis) -> None:
     audit_record(
         store, action="idle_check", origin="healthcheck",
@@ -297,12 +314,45 @@ def check_idle(
     config: OrchestratorConfig | None = None,
     clock: Callable[[], datetime] | None = None,
     paperclip_available: Callable[[], bool] | None = None,
+    paperclip_snapshot: Callable[[], dict] | None = None,
 ) -> IdleDiagnosis | None:
     """Returns a diagnosis only when apparent idleness is real and either
-    explained (Paperclip down, a dependency inconsistency) or genuinely
-    unexplained - `None` whenever there simply is no stall to explain
-    (no READY work, no free agent, work already in flight, or the quiet
-    period hasn't crossed the threshold yet)."""
+    explained (Paperclip down, a paused agent, a dependency inconsistency)
+    or genuinely unexplained - `None` whenever there simply is no stall to
+    explain (no READY work, no free agent, work already in flight, or the
+    quiet period hasn't crossed the threshold yet).
+
+    Only tasks NOT blocked by an unmet dependency count toward the
+    "genuinely idle" set: a single blocked READY task must never hide
+    OTHER READY work that has nothing stopping it (Review Task #113,
+    finding #1) - if every READY task turns out to be blocked, that is
+    reported instead, unescalated.
+
+    The grace period is anchored on whichever is more recent: the last
+    TASK_STARTED/TASK_COMPLETED event, or any task's own `updated_at`.
+    Relying on the event log alone would treat a brand-new database (no
+    events yet, but a READY task that only just got promoted) as if it
+    had been idle forever (finding #2) - a task's own `updated_at` is
+    always a real, present anchor for how recently the queue last
+    changed, even before any activity event exists.
+
+    A given idle episode - identified by the exact set of stalled READY
+    task ids - escalates via DECISION_REQUIRED at most once (finding #3):
+    a periodic poller must not re-ask the same question every tick while
+    nothing about the stall has changed. A different set of stalled tasks
+    (new work arrived, or some resolved) is a new episode and escalates
+    again.
+
+    A reachable Paperclip is also checked for a paused agent (Review Task
+    #113, finding #4: "CEO parece ativo?") via its existing snapshot
+    (#11) - if found, that IS the probable cause and is reported as such
+    without escalating. Attempting to un-pause it automatically is
+    deliberately NOT done here: the issue's own OUT OF SCOPE covers
+    correcao automatica, and unconditionally resuming a paused agent
+    could just as easily undo a deliberate pause (budget exhaustion, a
+    manual decision) as fix a stuck one - indistinguishable from the data
+    this module has access to.
+    """
     cfg = config or load_config()
     now = _now(clock)
 
@@ -321,28 +371,11 @@ def check_idle(
     if not agent_free:
         return None
 
-    last_activity = _last_activity_at(store)
-    if last_activity is not None:
-        elapsed_minutes = (now - last_activity).total_seconds() / 60
-        if elapsed_minutes < cfg.idle_check_minutes:
-            return None
-
-    ready_ids = tuple(task.id for task in ready)
-
-    check_paperclip = paperclip_available or client.is_available
-    if not check_paperclip():
-        diagnosis = IdleDiagnosis(
-            cause="paperclip_unavailable",
-            detail="Paperclip nao respondeu ao healthcheck - tarefas READY nao podem ser despachadas.",
-            ready_task_ids=ready_ids,
-            escalated=False,
-        )
-        _record(store, diagnosis)
-        return diagnosis
-
     promotable_ids = {task.id for task in get_promotable_tasks(all_tasks)}
-    blocked_ready_ids = tuple(task_id for task_id in ready_ids if task_id not in promotable_ids)
-    if blocked_ready_ids:
+    free_ready = [task for task in ready if task.id in promotable_ids]
+    blocked_ready_ids = tuple(task.id for task in ready if task.id not in promotable_ids)
+
+    if not free_ready:
         diagnosis = IdleDiagnosis(
             cause="dependency_blocked",
             detail="Tarefa(s) READY tem dependencia ainda nao concluida - inconsistencia de estado, nao ociosidade real.",
@@ -352,15 +385,54 @@ def check_idle(
         _record(store, diagnosis)
         return diagnosis
 
+    anchors = [task.updated_at for task in all_tasks]
+    last_activity = _last_activity_at(store)
+    if last_activity is not None:
+        anchors.append(last_activity)
+    elapsed_minutes = (now - max(anchors)).total_seconds() / 60
+    if elapsed_minutes < cfg.idle_check_minutes:
+        return None
+
+    free_ready_ids = tuple(task.id for task in free_ready)
+
+    check_paperclip = paperclip_available or client.is_available
+    if not check_paperclip():
+        diagnosis = IdleDiagnosis(
+            cause="paperclip_unavailable",
+            detail="Paperclip nao respondeu ao healthcheck - tarefas READY nao podem ser despachadas.",
+            ready_task_ids=free_ready_ids,
+            escalated=False,
+        )
+        _record(store, diagnosis)
+        return diagnosis
+
+    get_snapshot = paperclip_snapshot or client.get_snapshot
+    paused = _paused_agents(get_snapshot())
+    if paused:
+        diagnosis = IdleDiagnosis(
+            cause="agent_paused",
+            detail=f"Agente(s) pausado(s) no Paperclip: {', '.join(paused)} - provavel causa da ociosidade.",
+            ready_task_ids=free_ready_ids,
+            escalated=False,
+        )
+        _record(store, diagnosis)
+        return diagnosis
+
     diagnosis = IdleDiagnosis(
         cause="unexplained",
         detail="Tarefas READY, agente disponivel e Paperclip ok, mas nada em andamento ha mais tempo que o esperado.",
-        ready_task_ids=ready_ids,
+        ready_task_ids=free_ready_ids,
         escalated=True,
     )
-    emit(
-        store, EventType.DECISION_REQUIRED,
-        {"kind": "idle_stall", "cause": diagnosis.cause, "ready_task_ids": list(ready_ids)},
-    )
+    episode_id = hashlib.sha256(",".join(sorted(free_ready_ids)).encode("utf-8")).hexdigest()[:16]
+
+    def escalate(connection):
+        emit_in_transaction(
+            connection, EventType.DECISION_REQUIRED,
+            {"kind": "idle_stall", "cause": diagnosis.cause, "ready_task_ids": list(free_ready_ids)},
+            correlation_id=episode_id, created_at=now,
+        )
+
+    store.run_sync_once(f"idle_escalation:{episode_id}", now.isoformat(), escalate)
     _record(store, diagnosis)
     return diagnosis
