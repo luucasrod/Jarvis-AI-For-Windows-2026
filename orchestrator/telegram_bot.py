@@ -147,14 +147,21 @@ def receive_control_updates(
             continue
 
         update_id = update.get("update_id")
-        # Only a genuine int advances the cursor - a string/dict/list
-        # here would crash `last_update_id + 1` on the NEXT poll (well
-        # after this call already returned successfully), silently
-        # bricking the offset for every update after it (Review Task
-        # #70, 2nd revalidation). An invalid update_id keeps the last
-        # known-safe cursor instead of adopting an untrustworthy one.
-        if isinstance(update_id, int) and not isinstance(update_id, bool):
-            new_last_update_id = update_id
+        # An update_id that isn't a genuine, strictly-increasing int is
+        # never trustworthy enough to act on - skip the WHOLE update
+        # (never just the cursor assignment), so it can neither crash the
+        # next poll's `last_update_id + 1` (2nd revalidation) nor let an
+        # old/duplicate/regressed id re-deliver a command as if it were
+        # new, nor get emitted as a message event at all (Review Task
+        # #70, 3rd revalidation).
+        valid_id = (
+            isinstance(update_id, int)
+            and not isinstance(update_id, bool)
+            and (new_last_update_id is None or update_id > new_last_update_id)
+        )
+        if not valid_id:
+            continue
+        new_last_update_id = update_id
 
         message = update.get("message")
         if not isinstance(message, dict):
