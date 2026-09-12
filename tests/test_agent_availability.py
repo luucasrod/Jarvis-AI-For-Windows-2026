@@ -1,5 +1,15 @@
-"""Tests for orchestrator.agent_availability (issue #26)."""
+"""Tests for orchestrator.agent_availability (issue #26).
+
+The concurrency and reviewer-collision tests below are regressions from
+Codex's review (Review Task #109, 3 P1 findings): a read-then-write race
+between redirecting a task and another connection starting it, redirecting
+to a destination agent that's ALSO rate-limited, and a redirect that could
+leave preferred_agent == reviewer_preference (self-review).
+"""
+import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Barrier
 
 import pytest
 
@@ -164,4 +174,138 @@ def test_mark_rate_limited_rejects_non_concrete_agent(tmp_path):
     store = Store(tmp_path / "state.db")
     with pytest.raises(ValueError):
         mark_rate_limited(store, AgentName.EITHER, "x")
+    store.close()
+
+
+# --- Regressions from Codex's review (Review Task #109) -------------------
+
+def test_concurrent_redirect_and_task_start_never_corrupts_state(tmp_path):
+    # Finding #1: the old code read READY tasks and redirected them as two
+    # separate Store calls - a task started (READY -> IN_PROGRESS) by
+    # another connection in between got silently reverted back towards
+    # the stale READY snapshot. Whichever operation's transaction commits
+    # first must win cleanly; the other must see the up-to-date state.
+    path = tmp_path / "state.db"
+    task = _flex_task(preferred_agent=AgentName.CLAUDE)
+    setup_store = Store(path)
+    setup_store.save_task(task)
+    setup_store.close()
+
+    store_a, store_b = Store(path), Store(path)
+    barrier = Barrier(2)
+
+    def redirect():
+        barrier.wait(timeout=5)
+        mark_rate_limited(store_a, AgentName.CLAUDE, "usage limit")
+
+    def start_task():
+        barrier.wait(timeout=5)
+        def apply(connection):
+            row = connection.execute("SELECT data FROM tasks WHERE id = ?", (task.id,)).fetchone()
+            current = Task.from_dict(json.loads(row[0]))
+            current.state = TaskState.IN_PROGRESS
+            connection.execute(
+                "UPDATE tasks SET data = ?, state = ? WHERE id = ?",
+                (json.dumps(current.to_dict()), TaskState.IN_PROGRESS.value, task.id),
+            )
+        store_b.run_in_transaction(apply)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda fn: fn(), [redirect, start_task]))
+
+        final = store_a.get_task(task.id)
+        # Whichever transaction committed first, the result must be
+        # internally consistent - never an IN_PROGRESS task whose
+        # executor got silently swapped out from under it.
+        if final.state == TaskState.IN_PROGRESS:
+            assert final.preferred_agent == AgentName.CLAUDE
+        else:
+            assert final.state == TaskState.READY
+    finally:
+        store_a.close()
+        store_b.close()
+
+
+def test_redirect_does_not_move_to_an_equally_limited_destination(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _flex_task(preferred_agent=AgentName.CLAUDE)
+    store.save_task(task)
+    clock = Clock("2026-09-12T10:00:00+00:00")
+    mark_rate_limited(store, AgentName.CODEX, "usage limit", clock=clock)
+
+    mark_rate_limited(store, AgentName.CLAUDE, "usage limit", clock=clock)
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.preferred_agent == AgentName.CLAUDE
+    store.close()
+
+
+def test_redirect_happens_once_destination_cooldown_expires(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _flex_task(preferred_agent=AgentName.CLAUDE)
+    store.save_task(task)
+    clock = Clock("2026-09-12T10:00:00+00:00")
+    mark_rate_limited(store, AgentName.CODEX, "usage limit",
+                      reset_at=datetime(2026, 9, 12, 10, 5, tzinfo=timezone.utc), clock=clock)
+
+    clock.set("2026-09-12T10:05:00+00:00")
+    mark_rate_limited(store, AgentName.CLAUDE, "usage limit", clock=clock)
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.preferred_agent == AgentName.CODEX
+    store.close()
+
+
+def test_redirect_fixes_reviewer_collision_claude_to_codex(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _flex_task(preferred_agent=AgentName.CLAUDE, reviewer_preference=AgentName.CODEX)
+    store.save_task(task)
+
+    mark_rate_limited(store, AgentName.CLAUDE, "usage limit")
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.preferred_agent == AgentName.CODEX
+    assert reloaded.reviewer_preference == AgentName.CLAUDE
+    store.close()
+
+
+def test_redirect_fixes_reviewer_collision_codex_to_claude(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _flex_task(preferred_agent=AgentName.CODEX, reviewer_preference=AgentName.CLAUDE)
+    store.save_task(task)
+
+    mark_rate_limited(store, AgentName.CODEX, "usage limit")
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.preferred_agent == AgentName.CLAUDE
+    assert reloaded.reviewer_preference == AgentName.CODEX
+    store.close()
+
+
+def test_redirect_leaves_non_colliding_reviewer_untouched(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _flex_task(preferred_agent=AgentName.CLAUDE, reviewer_preference=AgentName.EITHER)
+    store.save_task(task)
+
+    mark_rate_limited(store, AgentName.CLAUDE, "usage limit")
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.preferred_agent == AgentName.CODEX
+    assert reloaded.reviewer_preference == AgentName.EITHER
+    store.close()
+
+
+def test_redirect_preserves_class_solo_and_dependencies(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _flex_task(preferred_agent=AgentName.CLAUDE, execution_mode=ExecutionMode.SOLO,
+                      reviewer_preference=AgentName.CODEX, dependencies=["dep-1"])
+    store.save_task(task)
+
+    mark_rate_limited(store, AgentName.CLAUDE, "usage limit")
+
+    reloaded = store.get_task(task.id)
+    assert reloaded.agent_class == AgentClass.FLEX
+    assert reloaded.execution_mode == ExecutionMode.SOLO
+    assert reloaded.dependencies == ["dep-1"]
     store.close()
