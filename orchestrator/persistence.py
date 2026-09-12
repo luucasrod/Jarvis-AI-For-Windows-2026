@@ -14,11 +14,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from orchestrator.models import Task, TaskState
 
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "orchestrator_state.db"
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -192,6 +195,42 @@ class Store:
             self._conn.commit()
 
     # --- sync state ------------------------------------------------------
+
+    def run_in_transaction(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
+        """Run local SQL effects atomically, including across Store instances.
+
+        The callback uses only the supplied connection; it must not commit,
+        call other Store methods, use executescript, or perform network I/O.
+        Existing Store methods retain their commit-per-call behavior.
+        """
+        with self._lock:
+            if self._conn.in_transaction:
+                raise RuntimeError("Nested Store transactions are not supported")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = operation(self._conn)
+                self._conn.commit()
+                return result
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def run_sync_once(
+        self, key: str, value: str, operation: Callable[[sqlite3.Connection], None]
+    ) -> bool:
+        """Commit an action and its sync guard together, or neither on failure.
+
+        Use a distinct key per occurrence (scheduler includes the local date).
+        Callback restrictions are the same as run_in_transaction.
+        """
+        def apply(connection: sqlite3.Connection) -> bool:
+            if connection.execute("SELECT 1 FROM sync_state WHERE key = ?", (key,)).fetchone():
+                return False
+            operation(connection)
+            connection.execute("INSERT INTO sync_state (key, value) VALUES (?, ?)", (key, value))
+            return True
+
+        return self.run_in_transaction(apply)
 
     def set_sync_value(self, key: str, value: str) -> None:
         with self._lock:

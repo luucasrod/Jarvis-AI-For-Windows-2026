@@ -8,6 +8,7 @@ via the generic Store.ensure_schema/execute/query helpers added for this.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -44,10 +45,37 @@ class EventType(str, Enum):
     # list but required by #19's own scope ("mensagem recebida no canal
     # de controle vira um evento telegram_message_received").
     TELEGRAM_MESSAGE_RECEIVED = "telegram_message_received"
+    REPORT_TIME_REACHED = "report_time_reached"
 
 
 def _ensure_table(store: Store) -> None:
     store.ensure_schema(_SCHEMA)
+
+
+def emit_in_transaction(
+    connection: sqlite3.Connection,
+    event_type: EventType,
+    payload: dict | None = None,
+    correlation_id: str | None = None,
+    project_id: str | None = None,
+    *,
+    created_at: datetime | None = None,
+) -> None:
+    """Append inside a caller-owned transaction without committing it (#25).
+
+    This lets a scheduler event and its once-per-day guard survive together.
+    Uses execute (one DDL statement), never executescript's implicit commit.
+    """
+    timestamp = created_at or datetime.now(timezone.utc)
+    if timestamp.utcoffset() is None:
+        raise ValueError("created_at must be timezone-aware")
+    connection.execute(_SCHEMA)
+    connection.execute(
+        "INSERT INTO events (event_type, payload, correlation_id, project_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (event_type.value, json.dumps(payload or {}), correlation_id, project_id,
+         timestamp.astimezone(timezone.utc).isoformat()),
+    )
 
 
 def emit(
