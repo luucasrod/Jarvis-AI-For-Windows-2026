@@ -259,6 +259,52 @@ def test_receive_control_updates_ignores_non_int_update_id_and_next_poll_is_safe
     store.close()
 
 
+@pytest.mark.parametrize("regressed_update_id", [9, 10])
+def test_receive_control_updates_rejects_cursor_regression(tmp_path, regressed_update_id):
+    # Review Task #70, 3rd revalidation: an update_id at or below the
+    # already-accepted cursor (old, duplicate, or replayed) must not move
+    # the cursor backward and must not be delivered as a "new" command.
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _RawJsonResponse(
+            200,
+            {"result": [{
+                "update_id": regressed_update_id,
+                "message": {"chat": {"id": 111}, "text": "Approve"},
+            }]},
+        )
+
+    result = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=10)
+    assert result == 10
+    assert query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED]) == []
+    store.close()
+
+
+@pytest.mark.parametrize("bad_update_id", ["11", {}, [], 1.5])
+def test_receive_control_updates_never_emits_for_invalid_update_id_even_with_valid_message(tmp_path, bad_update_id):
+    # An invalid update_id used to still let a valid chat/text through to
+    # emit() - only the cursor assignment was skipped, not the whole
+    # update. Two identical polls with the same malformed id must not
+    # deliver the same command twice (Review Task #70, 3rd revalidation).
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _RawJsonResponse(
+            200,
+            {"result": [{
+                "update_id": bad_update_id,
+                "message": {"chat": {"id": 111}, "text": "Approve"},
+            }]},
+        )
+
+    first = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=10)
+    second = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, last_update_id=first)
+    assert first == 10 and second == 10
+    assert query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED]) == []
+    store.close()
+
+
 def test_send_message_error_never_leaks_url_or_token():
     import requests
 
