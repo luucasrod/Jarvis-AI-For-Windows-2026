@@ -48,6 +48,47 @@ def test_secret_marker_matches_case_insensitively_and_substrings():
     assert redacted["plain"] == "w"
 
 
+# --- Regression tests from Codex's review (Review Task #103) --------------
+
+def test_secret_nested_in_dict_is_redacted(tmp_path):
+    store = Store(tmp_path / "state.db")
+    record(
+        store, action="call_api", origin="github_client", result="success",
+        extra={"request": {"apiKey": "synthetic-secret-20"}},
+    )
+
+    row = store.query("SELECT extra FROM audit_log")[0][0]
+    assert "synthetic-secret-20" not in row
+
+    entries = query_audit(store)
+    assert entries[0]["extra"]["request"]["apiKey"] == "***"
+    store.close()
+
+
+def test_secret_nested_in_list_of_dicts_is_redacted(tmp_path):
+    store = Store(tmp_path / "state.db")
+    record(
+        store, action="call_api", origin="paperclip_ops", result="success",
+        extra={"attempts": [{"nested": {"TELEGRAM_BOT_TOKEN": "synthetic-secret-20"}}]},
+    )
+
+    row = store.query("SELECT extra FROM audit_log")[0][0]
+    assert "synthetic-secret-20" not in row
+
+    entries = query_audit(store)
+    assert entries[0]["extra"]["attempts"][0]["nested"]["TELEGRAM_BOT_TOKEN"] == "***"
+    store.close()
+
+
+def test_redact_secrets_does_not_mutate_original_input():
+    from orchestrator.audit import _redact_secrets
+
+    original = {"request": {"apiKey": "secret"}, "note": "ok"}
+    _redact_secrets(original)
+    assert original["request"]["apiKey"] == "secret"
+    assert original["note"] == "ok"
+
+
 def test_query_filters_by_project(tmp_path):
     store = Store(tmp_path / "state.db")
     record(store, action="a1", origin="o", result="r", project_id="cashy")

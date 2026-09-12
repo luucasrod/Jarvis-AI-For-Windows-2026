@@ -33,16 +33,28 @@ def _ensure_table(store: Store) -> None:
     store.ensure_schema(_SCHEMA)
 
 
+def _redact_value(value):
+    """Recurses into dicts/lists so a secret buried at any depth (a
+    nested request body, a list of attempt records, ...) is redacted
+    just like a top-level one - the original object is never mutated
+    (Review Task #103)."""
+    if isinstance(value, dict):
+        return _redact_secrets(value)
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    return value
+
+
 def _redact_secrets(extra: dict) -> dict:
     """Redacts any key whose name suggests it holds a credential,
-    regardless of its value's type - defense in depth, never trust the
-    caller to have already scrubbed `extra`."""
+    regardless of its value's type or nesting depth - defense in depth,
+    never trust the caller to have already scrubbed `extra`."""
     redacted = {}
     for key, value in extra.items():
         if any(marker in key.lower() for marker in _SECRET_KEY_MARKERS):
             redacted[key] = "***"
         else:
-            redacted[key] = value
+            redacted[key] = _redact_value(value)
     return redacted
 
 
