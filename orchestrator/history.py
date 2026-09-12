@@ -21,12 +21,9 @@ _COUNTED_EVENT_TYPES = (
     EventType.BUG_FOUND,
     EventType.DEPLOYMENT_FINISHED,
     EventType.DECISION_REQUIRED,
+    EventType.DECISION_RECEIVED,
+    EventType.MERGE_COMPLETED,
 )
-
-# BLOCKED isn't a distinct EventType in #14's list - a task being blocked
-# is inferred from DECISION_REQUIRED (NEEDS_LUCAS) events for now. If a
-# dedicated event is added later, this mapping is the one place to update.
-_BLOCKED_PROXY_EVENT = EventType.DECISION_REQUIRED
 
 
 @dataclass
@@ -34,22 +31,35 @@ class HistorySummary:
     since: datetime
     tasks_created: int = 0
     tasks_completed: int = 0
-    tasks_blocked: int = 0
+    decisions_pending: int = 0
     reviews_passed: int = 0
     reviews_failed: int = 0
     bugs_found: int = 0
     deployments_finished: int = 0
+    merges_completed: int = 0
     by_project: dict[str, dict[str, int]] = field(default_factory=dict)
     total_events: int = 0
 
 
 def diff_since(store: Store, since: datetime) -> HistorySummary:
+    """`decisions_pending` counts DECISION_REQUIRED events in the window
+    whose correlation_id has NOT since seen a matching DECISION_RECEIVED
+    (also in the window) - a decision that was asked AND answered within
+    the same period must not be reported as currently awaiting a
+    response (Review Task #68). This is deliberately about decisions
+    specifically, not a general notion of "blocked": #14's event log has
+    no dedicated BLOCKED event, and a task can be genuinely stuck
+    (dependency/cycle) without ever generating a DECISION_REQUIRED - this
+    module has no signal for that case and does not claim to.
+    """
     events = query_events(store, since=since, event_types=list(_COUNTED_EVENT_TYPES))
     summary = HistorySummary(since=since, total_events=len(events))
+    pending_decision_correlations: set[str] = set()
 
     for event in events:
         event_type = event["event_type"]
         project_id = event["project_id"] or "sem_projeto"
+        correlation_id = event.get("correlation_id")
 
         project_counts = summary.by_project.setdefault(project_id, {})
         project_counts[event_type.value] = project_counts.get(event_type.value, 0) + 1
@@ -66,9 +76,16 @@ def diff_since(store: Store, since: datetime) -> HistorySummary:
             summary.bugs_found += 1
         elif event_type == EventType.DEPLOYMENT_FINISHED:
             summary.deployments_finished += 1
-        elif event_type == _BLOCKED_PROXY_EVENT:
-            summary.tasks_blocked += 1
+        elif event_type == EventType.MERGE_COMPLETED:
+            summary.merges_completed += 1
+        elif event_type == EventType.DECISION_REQUIRED:
+            if correlation_id:
+                pending_decision_correlations.add(correlation_id)
+        elif event_type == EventType.DECISION_RECEIVED:
+            if correlation_id:
+                pending_decision_correlations.discard(correlation_id)
 
+    summary.decisions_pending = len(pending_decision_correlations)
     return summary
 
 
@@ -81,8 +98,8 @@ def summarize_for_voice(summary: HistorySummary) -> str:
         parts.append(f"{summary.tasks_created} tarefa(s) criada(s)")
     if summary.tasks_completed:
         parts.append(f"{summary.tasks_completed} concluida(s)")
-    if summary.tasks_blocked:
-        parts.append(f"{summary.tasks_blocked} bloqueada(s) esperando decisao")
+    if summary.decisions_pending:
+        parts.append(f"{summary.decisions_pending} decisao(oes) pendente(s)")
     if summary.reviews_passed:
         parts.append(f"{summary.reviews_passed} revisao(oes) aprovada(s)")
     if summary.reviews_failed:
@@ -91,6 +108,8 @@ def summarize_for_voice(summary: HistorySummary) -> str:
         parts.append(f"{summary.bugs_found} bug(s) encontrado(s)")
     if summary.deployments_finished:
         parts.append(f"{summary.deployments_finished} deploy(s) concluido(s)")
+    if summary.merges_completed:
+        parts.append(f"{summary.merges_completed} merge(s) concluido(s)")
 
     if not parts:
         return "Alguma atividade registrada, mas nada nas categorias principais."
