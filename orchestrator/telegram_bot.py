@@ -147,7 +147,13 @@ def receive_control_updates(
             continue
 
         update_id = update.get("update_id")
-        if update_id is not None:
+        # Only a genuine int advances the cursor - a string/dict/list
+        # here would crash `last_update_id + 1` on the NEXT poll (well
+        # after this call already returned successfully), silently
+        # bricking the offset for every update after it (Review Task
+        # #70, 2nd revalidation). An invalid update_id keeps the last
+        # known-safe cursor instead of adopting an untrustworthy one.
+        if isinstance(update_id, int) and not isinstance(update_id, bool):
             new_last_update_id = update_id
 
         message = update.get("message")

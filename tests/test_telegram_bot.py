@@ -1,5 +1,7 @@
 """Tests for orchestrator.telegram_bot (issue #19). No real network call -
 post_fn/get_fn are always injected fakes."""
+import pytest
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.events import EventType, query_events
 from orchestrator.persistence import Store
@@ -226,6 +228,34 @@ def test_receive_control_updates_survives_null_chat_and_advances_cursor(tmp_path
     # payload isn't) so the next poll doesn't refetch it forever.
     assert result == 11
     assert query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED]) == []
+    store.close()
+
+
+@pytest.mark.parametrize("bad_update_id", ["11", {}, [], 1.5, True])
+def test_receive_control_updates_ignores_non_int_update_id_and_next_poll_is_safe(tmp_path, bad_update_id):
+    # A malformed update_id used to be adopted as the new cursor, then
+    # crash `last_update_id + 1` on the NEXT poll - well after this call
+    # already returned "successfully" (Review Task #70, 2nd
+    # revalidation). It must instead keep the last known-safe cursor.
+    store = Store(tmp_path / "state.db")
+    seen_params = []
+
+    def fake_get_first(url, params, timeout):
+        seen_params.append(params)
+        return _RawJsonResponse(
+            200, {"result": [{"update_id": bad_update_id, "message": {"chat": None}}]}
+        )
+
+    first = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get_first, last_update_id=10)
+    assert first == 10
+
+    def fake_get_second(url, params, timeout):
+        seen_params.append(params)
+        return _RawJsonResponse(200, {"result": []})
+
+    second = receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get_second, last_update_id=first)
+    assert second == 10
+    assert seen_params[1]["offset"] == 11
     store.close()
 
 
