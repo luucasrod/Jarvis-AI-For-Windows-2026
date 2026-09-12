@@ -16,11 +16,31 @@ already-pending decision) - added by issue #31, not implemented here
 """
 from __future__ import annotations
 
+import hashlib
+
 from orchestrator.models import Task
 from orchestrator.persistence import Store
 from orchestrator.telegram_bot import send_control_message
 
 _OPTION_LETTERS = "ABCDEFGHIJ"
+
+
+def _decision_ref(task: Task, basis: str) -> str:
+    """Short, deterministic reference derived from the QUESTION's own
+    content (not just the task) - two different questions on the same
+    task get two different refs, while retrying the identical question
+    reproduces the same ref (Review Task #80).
+
+    Used for two things: (1) embedded in the human-facing message so a
+    reply can cite which pending decision it answers when a task has
+    more than one (message_id/reply association is #31's job - this is
+    the simpler alternative Codex's review explicitly allowed); (2) as
+    the suffix of the default correlation_id (see create_pending_decision)
+    so a second, distinct question never overwrites/inherits the
+    resolved=1 state of an earlier, already-answered one for the same
+    task.
+    """
+    return hashlib.sha256(f"{task.id}:{basis}".encode("utf-8")).hexdigest()[:8]
 
 
 def format_decision_message(
@@ -49,7 +69,10 @@ def format_decision_message(
         f"{_OPTION_LETTERS[i]}) {option}" for i, option in enumerate(options)
     )
 
+    ref = _decision_ref(task, problem)
+
     return (
+        f"REF: {ref}\n\n"
         f"PROJETO:\n{project_line}\n\n"
         f"CONTEXTO:\n{context_line}\n\n"
         f"PROBLEMA:\n{problem}\n\n"
@@ -71,8 +94,17 @@ def create_pending_decision(
     channel (#19). Returns (ok, error) from the send - the decision is
     ALWAYS persisted regardless of whether Telegram delivery succeeds,
     so a Telegram outage never loses the pending decision itself (it can
-    still be surfaced through voice, #27, once that exists)."""
-    correlation_id = correlation_id or task.correlation_id
+    still be surfaced through voice, #27, once that exists).
+
+    Defaults `correlation_id` to a hash of (task, message) rather than
+    bare `task.correlation_id` - reusing the task's own fixed id for
+    EVERY decision on that task meant a second, different question
+    silently overwrote the first row via the decisions table's UPSERT,
+    inheriting its resolved=1 state and vanishing from the pending queue
+    even though nobody answered the new question (Review Task #80).
+    Retrying the IDENTICAL message still maps to the same correlation_id
+    (idempotent - no duplicate row), since the hash is deterministic."""
+    correlation_id = correlation_id or f"{task.correlation_id}:{_decision_ref(task, message)}"
     store.save_decision(correlation_id=correlation_id, task_id=task.id, message=message)
     return send_control_message(message)
 
