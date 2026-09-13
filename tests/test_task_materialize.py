@@ -568,3 +568,32 @@ def test_incomplete_relationship_backfill_is_queryable_for_retry(tmp_path):
     assert list_incomplete_relationships(store, repo='owner/repo') == incomplete
     assert list_incomplete_relationships(store, repo='someone/else') == []
     store.close()
+
+
+def test_successful_retry_clears_incomplete_relationship_record(tmp_path):
+    # Regression (Review Task #117 round 4): a PATCH failure recorded an
+    # "incomplete" entry, but a later successful retry of the SAME repair
+    # never recorded completion, so list_incomplete_relationships kept
+    # returning the stale entry forever even after the relationship was
+    # actually fixed on GitHub.
+    store = Store(tmp_path / 'state.db')
+    github = GitHub(patch_error="server error")
+    client = GitHubClient(store, config=OrchestratorConfig(retry_interval_seconds=10),
+                          run_fn=github.run, clock=Clock(), timeout_seconds=5)
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+    assert len(list_incomplete_relationships(store)) == 1
+
+    # Same plan replayed: create_issue dedupes onto the same Issues (base
+    # correlation_id already recorded), but the PATCH now succeeds.
+    github.patch_error = None
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    assert list_incomplete_relationships(store) == []
+    base_issue = next(issue for issue in github.issues if issue['number'] == 1)
+    blocks_line = next(line for line in base_issue['body'].splitlines() if line.startswith("BLOCKS:"))
+    assert "#2" in blocks_line
+    store.close()
