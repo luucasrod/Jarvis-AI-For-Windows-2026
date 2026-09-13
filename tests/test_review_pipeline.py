@@ -58,6 +58,33 @@ def test_pass_without_head_sha_omits_it_from_the_event(tmp_path):
     store.close()
 
 
+def test_pass_with_repo_and_pr_number_records_them_on_the_event(tmp_path):
+    # Added for #37's merge_policy attestation binding, round 3 (Review
+    # Task #111): a commit SHA alone isn't unique across forks/repos.
+    store = Store(tmp_path / "state.db")
+    task = _make_task()
+
+    request_review(task, AgentName.CODEX, AgentName.CLAUDE, passed=True, store=store,
+                   head_sha="a" * 40, repo="org/repo", pr_number=42)
+
+    events = query_events(store, event_types=[EventType.REVIEW_PASSED])
+    assert events[0]["payload"]["repo"] == "org/repo"
+    assert events[0]["payload"]["pr_number"] == 42
+    store.close()
+
+
+def test_pass_without_repo_or_pr_number_omits_them_from_the_event(tmp_path):
+    store = Store(tmp_path / "state.db")
+    task = _make_task()
+
+    request_review(task, AgentName.CODEX, AgentName.CLAUDE, passed=True, store=store)
+
+    events = query_events(store, event_types=[EventType.REVIEW_PASSED])
+    assert "repo" not in events[0]["payload"]
+    assert "pr_number" not in events[0]["payload"]
+    store.close()
+
+
 def test_first_failure_returns_to_same_implementer(tmp_path):
     store = Store(tmp_path / "state.db")
     task = _make_task()

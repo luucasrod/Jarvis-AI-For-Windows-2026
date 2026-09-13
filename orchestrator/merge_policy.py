@@ -14,30 +14,36 @@ normal job).
 `expected_head_sha` and `expected_base` are supplied by the caller (the
 runtime that requested/received the review). The review attestation
 itself is no longer caller-supplied alone: #29's request_review() now
-accepts an optional `head_sha` and records it on REVIEW_PASSED (Review
-Task #111, finding #1 - a caller-supplied expected_head_sha that merely
-gets compared to the PR's current head does not prove THAT commit was
-what got reviewed; a PASS event for one head must not authorize merging
-a different one). `_review_passed` here requires the last REVIEW_PASSED
-event's own recorded head_sha to match `expected_head_sha` - a PASS with
-no head_sha recorded (an older caller, or one that couldn't supply it)
-is treated as no attestation for THIS commit, not as a pass.
+accepts optional `head_sha`, `repo` and `pr_number`, recorded together on
+REVIEW_PASSED (Review Task #111, round 1 finding #1 - a caller-supplied
+expected_head_sha that merely gets compared to the PR's current head
+does not prove THAT commit was what got reviewed). `_review_passed` here
+requires the last REVIEW_PASSED event's own recorded task_id, repo,
+pr_number AND head_sha to ALL match this call's - a commit SHA alone is
+not unique across forks, unrelated repos, or different base branches of
+the same PR (round 3, finding #1: three independent reproductions showed
+a PASS explicitly recorded for a different task/repo/PR still
+authorizing a merge whenever the SHA happened to coincide). A PASS
+missing any of these fields (an older caller, or one for a task with no
+PR) is treated as no attestation for auto-merge, not as a pass.
 
 Every decision (merged, skipped, or failed) is recorded via #20's audit
 log, per the issue's own risk-mitigation note (RISK: Alto). A completed
 merge's event AND audit record are written together, atomically, via
 #13's run_sync_once + #20's record_in_transaction, keyed on (repo, PR,
 head sha) - reached from BOTH "GitHub already reports this merged" and
-"we just merged it and confirmed" (Review Task #111, finding #2: the
-first version only reconciled completion on the path where THIS call
-performed the merge - a crash between a successful remote merge and
-recording it left the already-merged path forever silent on retry,
-since it returned early without ever calling this reconciliation).
-Either path also verifies the merged PR's head actually matches
-`expected_head_sha` before ever reporting success (finding #3) - a
-race where a different commit ends up merged is reported as
-`merged_different_head`, never silently claimed as this task's own
-completion.
+"we just merged it and confirmed" (round 2, finding #2: the first
+version only reconciled completion on the path where THIS call performed
+the merge - a crash between a successful remote merge and recording it
+left the already-merged path forever silent on retry). Both paths verify
+the merged PR's base AND head actually match `expected_base`/
+`expected_head_sha` before ever reporting success - base was checked
+only on the not-yet-merged branch until round 3, finding #2 showed a PR
+already merged into the wrong target (e.g. main instead of the
+integration checkpoint) with a matching head still being reported as
+success. A base mismatch reports `merged_unexpected_base`; a head
+mismatch reports `merged_different_head` - neither is ever silently
+claimed as this task's own completion.
 
 All GitHub calls go through `gh` CLI via subprocess with argument arrays,
 same pattern as #17's github_client.py - no shell involved, still fully
@@ -76,13 +82,21 @@ class MergeOutcome:
     already_merged: bool = False
 
 
-def _review_passed(store: Store, task: Task, expected_head_sha: str) -> bool:
+def _review_passed(store: Store, task: Task, repo: str, pr_number: int, expected_head_sha: str) -> bool:
     """True only if the LAST review verdict recorded for this task (by
-    its correlation_id) was PASS *for this exact commit* - a later
-    REVIEW_FAILED always overrides an earlier PASS, no verdict at all is
-    never treated as a pass, and a PASS recorded without a head_sha (or
-    for a different one) is not an attestation for `expected_head_sha`
-    and is likewise never treated as a pass."""
+    its correlation_id) was PASS *for this exact task/repo/PR/commit* - a
+    later REVIEW_FAILED always overrides an earlier PASS, no verdict at
+    all is never treated as a pass, and a PASS missing any of these
+    fields (an older caller, or one for a task with no PR) is not a full
+    attestation and is likewise never treated as a pass for auto-merge.
+
+    A commit SHA alone is not unique across forks, across unrelated
+    repos, or across different base branches of the same repo/PR - binding
+    task_id + repo (case-insensitively, matching #17's own normalization)
+    + pr_number closes the gap a SHA-only check left open (Review Task
+    #111, round 3, finding #1): three independent reproductions showed a
+    PASS explicitly recorded for a different task, repo, or PR still
+    authorizing a merge whenever the SHA happened to coincide."""
     events = query_events(
         store, correlation_id=task.correlation_id,
         event_types=[EventType.REVIEW_PASSED, EventType.REVIEW_FAILED],
@@ -90,7 +104,15 @@ def _review_passed(store: Store, task: Task, expected_head_sha: str) -> bool:
     if not events:
         return False
     last = events[-1]
-    return last["event_type"] == EventType.REVIEW_PASSED and last["payload"].get("head_sha") == expected_head_sha
+    if last["event_type"] != EventType.REVIEW_PASSED:
+        return False
+    payload = last["payload"]
+    return (
+        payload.get("task_id") == task.id
+        and payload.get("head_sha") == expected_head_sha
+        and isinstance(payload.get("repo"), str) and payload["repo"].lower() == repo.lower()
+        and payload.get("pr_number") == pr_number
+    )
 
 
 def _pr_view(repo: str, pr_number: int, run_fn: Callable, timeout: float) -> dict:
@@ -222,7 +244,7 @@ def try_auto_merge(
         return MergeOutcome(merged=True, reason="merged" if newly_recorded else "already_merged",
                              already_merged=not newly_recorded)
 
-    if not _review_passed(store, task, expected_head_sha):
+    if not _review_passed(store, task, repo, pr_number, expected_head_sha):
         return _fail("review_not_passed")
 
     try:
@@ -231,6 +253,10 @@ def try_auto_merge(
         return _fail(error.reason, result="failed")
 
     if pr.get("state") == "MERGED":
+        if pr.get("baseRefName") != expected_base:
+            # Merged, but into the WRONG target (e.g. main instead of the
+            # integration checkpoint) - never claimed as OUR completion.
+            return _fail("merged_unexpected_base", result="failed")
         if pr.get("headRefOid") != expected_head_sha:
             # Some other commit ended up merged (a race, or a stale call
             # against a PR that moved on) - never claimed as OUR success.
@@ -267,6 +293,9 @@ def try_auto_merge(
         if merge_command_succeeded:
             return _fail("merge_queued_unconfirmed")
         return _fail("merge_command_failed", result="failed")
+
+    if confirmed.get("baseRefName") != expected_base:
+        return _fail("merged_unexpected_base", result="failed")
 
     if confirmed.get("headRefOid") != expected_head_sha:
         # Between our pre-merge check and this confirmation, a different

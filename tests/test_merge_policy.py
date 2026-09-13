@@ -45,10 +45,15 @@ def _view_json(*, state="OPEN", is_draft=False, base=BASE, head=HEAD,
     })
 
 
-def _pass_review(store, task, *, head_sha=HEAD):
-    payload = {"task_id": task.id}
+def _pass_review(store, task, *, head_sha=HEAD, repo=REPO, pr_number=42,
+                 task_id_override=None):
+    payload = {"task_id": task_id_override if task_id_override is not None else task.id}
     if head_sha is not None:
         payload["head_sha"] = head_sha
+    if repo is not None:
+        payload["repo"] = repo
+    if pr_number is not None:
+        payload["pr_number"] = pr_number
     emit(store, EventType.REVIEW_PASSED, payload, correlation_id=task.correlation_id)
 
 
@@ -506,4 +511,101 @@ def test_crash_before_recording_is_recovered_via_the_already_merged_path(store, 
     assert len(events) == 1
     entries = query_audit(store)
     assert any(e["action"] == "auto_merge" and e["result"] == "success" for e in entries)
+    store.close()
+
+
+# --- Regressions from Codex's round-3 review (Review Task #111) -----------
+
+def test_pass_for_a_different_task_is_not_an_attestation_for_this_one(store, task):
+    # Round 3, finding #1: a SHA match alone isn't unique enough - a PASS
+    # explicitly recorded for a DIFFERENT task_id must not authorize this
+    # task's merge even if head/repo/pr_number all happen to coincide.
+    _pass_review(store, task, task_id_override="some-other-task-id")
+
+    def run_fn(args, **kwargs):
+        return _Result(stdout=_view_json())
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result.reason == "review_not_passed"
+    store.close()
+
+
+def test_pass_for_a_different_repo_is_not_an_attestation_for_this_one(store, task):
+    _pass_review(store, task, repo="org/other-repo")
+
+    def run_fn(args, **kwargs):
+        return _Result(stdout=_view_json())
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result.reason == "review_not_passed"
+    store.close()
+
+
+def test_pass_for_a_different_pr_is_not_an_attestation_for_this_one(store, task):
+    _pass_review(store, task, pr_number=99)
+
+    def run_fn(args, **kwargs):
+        return _Result(stdout=_view_json())
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result.reason == "review_not_passed"
+    store.close()
+
+
+def test_pass_missing_repo_or_pr_number_is_not_a_full_attestation(store, task):
+    # An older caller (or one for a task with no PR) that only supplied
+    # head_sha must not authorize auto-merge either - full identity is
+    # required, not just whichever fields happen to be present.
+    _pass_review(store, task, repo=None, pr_number=None)
+
+    def run_fn(args, **kwargs):
+        return _Result(stdout=_view_json())
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result.reason == "review_not_passed"
+    store.close()
+
+
+def test_repo_comparison_is_case_insensitive(store, task):
+    _pass_review(store, task, repo=REPO.upper())
+    views = iter([_view_json(state="OPEN"), _view_json(state="MERGED")])
+
+    def run_fn(args, **kwargs):
+        if args[1:3] == ["pr", "view"]:
+            return _Result(stdout=next(views))
+        return _Result()
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result.merged is True
+    store.close()
+
+
+def test_already_merged_into_wrong_base_is_never_claimed_as_success(store, task):
+    # Round 3, finding #2: GitHub already reports MERGED with a matching
+    # head, but into the WRONG base (e.g. main instead of the intended
+    # integration checkpoint) - must never be claimed as this task's own
+    # completion, on either MERGED-observation path.
+    _pass_review(store, task)
+
+    def run_fn(args, **kwargs):
+        return _Result(stdout=_view_json(state="MERGED", base="main"))
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result == MergeOutcome(merged=False, reason="merged_unexpected_base")
+    assert query_events(store, event_types=[EventType.MERGE_COMPLETED]) == []
+    store.close()
+
+
+def test_confirmed_merge_into_wrong_base_is_never_claimed_as_success(store, task):
+    _pass_review(store, task)
+    views = iter([_view_json(state="OPEN"), _view_json(state="MERGED", base="main")])
+
+    def run_fn(args, **kwargs):
+        if args[1:3] == ["pr", "view"]:
+            return _Result(stdout=next(views))
+        return _Result(returncode=0)
+
+    result = _merge(task, store, run_fn=run_fn)
+    assert result == MergeOutcome(merged=False, reason="merged_unexpected_base")
+    assert query_events(store, event_types=[EventType.MERGE_COMPLETED]) == []
     store.close()

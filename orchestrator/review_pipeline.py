@@ -100,6 +100,8 @@ def request_review(
     feedback: str = "",
     *,
     head_sha: str | None = None,
+    repo: str | None = None,
+    pr_number: int | None = None,
 ) -> ReviewResult:
     """Processes the verdict of an already-performed independent review
     (reviewer must differ from implementer - #24's classify_task only
@@ -111,13 +113,19 @@ def request_review(
     session's judgement) - this function's own job is purely the state
     machine around that verdict, not performing the review.
 
-    `head_sha`, when the caller can supply it (a task backed by a PR),
-    is recorded on the REVIEW_PASSED event so a consumer - #37's
-    merge_policy, specifically - can verify the review it's relying on
-    was actually performed against the EXACT commit it's about to merge,
-    not just "this task, at some point, passed review" (added per Review
-    Task #111's demand for a durable, checkable attestation rather than
-    a caller-supplied claim alone).
+    `head_sha`, `repo` and `pr_number`, when the caller can supply them
+    (a task backed by a PR), are recorded on the REVIEW_PASSED event so a
+    consumer - #37's merge_policy, specifically - can verify the review
+    it's relying on was actually performed against the EXACT commit, PR
+    and repo it's about to merge, not just "this task, at some point,
+    passed review" (added per Review Task #111's demand for a durable,
+    checkable attestation rather than a caller-supplied claim alone; a
+    SHA match alone isn't unique across forks/repos or across different
+    base branches of the same repo, hence also binding repo+pr_number).
+    All three are optional and independent - a caller for a task with no
+    PR (most of this pipeline's other uses) simply omits them, and
+    merge_policy alone is the consumer that requires the full set before
+    trusting a PASS for auto-merge.
 
     Raises ValueError if implementer/reviewer aren't two distinct,
     concrete agents - classify_task only RECOMMENDS who should review,
@@ -144,6 +152,10 @@ def request_review(
         payload = {"task_id": task.id, "reviewer": reviewer.value}
         if head_sha is not None:
             payload["head_sha"] = head_sha
+        if repo is not None:
+            payload["repo"] = repo
+        if pr_number is not None:
+            payload["pr_number"] = pr_number
         emit(
             store,
             EventType.REVIEW_PASSED,
