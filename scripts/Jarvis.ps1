@@ -41,7 +41,7 @@ $pidFile = Join-Path $root '.jarvis.pid'
 $logFile = Join-Path $root 'jarvis.log'
 $venvScripts = Join-Path $root '.venv\Scripts'
 
-function Test-JarvisProcess($Process) {
+function Test-JarvisProcess($Process, [switch]$AllowRelativeChild) {
     if ($Process.Name -notin @('python.exe', 'pythonw.exe') -or !$Process.CommandLine) { return $false }
     $arguments = [JarvisArguments]::Parse($Process.CommandLine)
     # Accept only a script invocation, never python -c/-m or a filename buried
@@ -59,6 +59,7 @@ function Test-JarvisProcess($Process) {
     # Compatibility with the old .bat: project venv + literal main.py. A bare
     # system Python with a relative script has no provable project identity.
     if ($script -notin @('main.py', '.\main.py', './main.py')) { return $false }
+    if ($AllowRelativeChild) { return $true }
     if (![IO.Path]::IsPathRooted($arguments[0])) { return $false }
     return (Get-FullPath $arguments[0]) -in @(
         (Join-Path $venvScripts 'python.exe'), (Join-Path $venvScripts 'pythonw.exe')
@@ -67,8 +68,27 @@ function Test-JarvisProcess($Process) {
 
 function Get-JarvisProcesses {
     # Failure to enumerate is an error, never interpreted as an empty list.
-    return @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-        Where-Object { Test-JarvisProcess $_ })
+    $snapshot = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'")
+    $owned = @{}
+    foreach ($process in $snapshot) {
+        if (Test-JarvisProcess $process) { $owned[[int]$process.ProcessId] = $process }
+    }
+    # Python 3.12 venv redirectors may give the worker a system-python argv[0]
+    # plus relative main.py. Adopt it only through a verified, older parent
+    # in this same snapshot, never through an arbitrary PID-file claim.
+    do {
+        $changed = $false
+        foreach ($process in $snapshot) {
+            if ($owned.ContainsKey([int]$process.ProcessId)) { continue }
+            $parent = $owned[[int]$process.ParentProcessId]
+            if ($parent -and $parent.CreationDate -le $process.CreationDate -and
+                (Test-JarvisProcess $process -AllowRelativeChild)) {
+                $owned[[int]$process.ProcessId] = $process
+                $changed = $true
+            }
+        }
+    } while ($changed)
+    return @($owned.Values | Sort-Object ProcessId)
 }
 
 function Get-PidState($Processes) {
@@ -108,7 +128,7 @@ function Stop-Jarvis {
             $null = $live.Handle
             $current = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $candidate.ProcessId)
             if (!$current) { continue }
-            if ($current.CreationDate -ne $candidate.CreationDate -or !(Test-JarvisProcess $current)) {
+            if ($current.CreationDate -ne $candidate.CreationDate -or $current.CommandLine -cne $candidate.CommandLine) {
                 throw 'Process identity changed; retry status before stopping.'
             }
             $live.Kill()

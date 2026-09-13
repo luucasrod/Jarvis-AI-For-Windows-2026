@@ -53,7 +53,12 @@ para o launcher/filho do venv. A busca agora exige invocacao Python de `main.py`
 com caminho exato deste projeto. Para o formato antigo `main.py` relativo,
 aceita apenas executavel explicitamente no venv deste projeto; esse venv deve
 continuar reservado ao projeto. Um Python global com caminho relativo ambiguo
-nao e encerrado. Invocacoes `-c`, `-m`, scripts de teste e outros projetos nao
+nao e encerrado sem evidencia adicional: o filho do redirector Python 3.12 e
+reconhecido pelo parentesco com o launcher verificado, na mesma leitura de
+processos e com data de criacao coerente. Se um processo legado relativo ja
+perdeu esse pai e a identidade ficou ambigua, exige inspecao manual. Os novos
+launchers sempre usam caminho absoluto, inclusive para reconhecer orfaos.
+Invocacoes `-c`, `-m`, scripts de teste e outros projetos nao
 sao selecionados por simplesmente conterem o nome do repositorio.
 
 Antes de encerrar, revalida identidade e data de criacao com o handle aberto,
