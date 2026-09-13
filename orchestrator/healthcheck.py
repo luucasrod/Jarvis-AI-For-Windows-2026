@@ -329,19 +329,33 @@ def check_idle(
     reported instead, unescalated.
 
     The grace period is anchored on whichever is more recent: the last
-    TASK_STARTED/TASK_COMPLETED event, or any task's own `updated_at`.
-    Relying on the event log alone would treat a brand-new database (no
-    events yet, but a READY task that only just got promoted) as if it
-    had been idle forever (finding #2) - a task's own `updated_at` is
-    always a real, present anchor for how recently the queue last
-    changed, even before any activity event exists.
+    TASK_STARTED/TASK_COMPLETED event, or the free/stalled READY tasks'
+    OWN `updated_at`. Relying on the event log alone would treat a
+    brand-new database (no events yet, but a READY task that only just
+    got promoted) as if it had been idle forever (finding #2) - a task's
+    own `updated_at` is always a real, present anchor for how recently
+    the queue last changed, even before any activity event exists.
+    Anchoring on EVERY task's updated_at (not just the free/stalled ones)
+    was tried and rejected (Review Task #113, round 2, finding #2): an
+    unrelated BLOCKED task getting touched moments ago would then mask a
+    genuinely stale free task indefinitely - only signals relevant to the
+    stalled work itself, or genuine system-wide activity, may reset it.
 
-    A given idle episode - identified by the exact set of stalled READY
-    task ids - escalates via DECISION_REQUIRED at most once (finding #3):
-    a periodic poller must not re-ask the same question every tick while
-    nothing about the stall has changed. A different set of stalled tasks
-    (new work arrived, or some resolved) is a new episode and escalates
-    again.
+    A given idle episode escalates via DECISION_REQUIRED at most once
+    (finding #3): a periodic poller must not re-ask the same question
+    every tick while nothing about the stall has changed. An episode is
+    identified by BOTH the exact set of stalled READY task ids AND the
+    grace-period anchor that qualified it - the anchor changing (a
+    TASK_COMPLETED event, or the stalled set's own updated_at moving)
+    means the earlier stall ended and, if the same tasks stall again
+    later, that is a genuinely new episode and must escalate again (round
+    2, finding #1: identifying an episode by task ids alone made a
+    second, later stall of the exact same tasks - separated by real
+    recovered activity in between - permanently silent after the first).
+    The returned `escalated` (and the audit log) reflect whether THIS
+    call actually emitted a fresh escalation, not just whether the cause
+    is "unexplained" - a repeated poll of an already-escalated episode is
+    correctly a no-op, not another "escalated" outcome.
 
     A reachable Paperclip is also checked for a paused agent (Review Task
     #113, finding #4: "CEO parece ativo?") via its existing snapshot
@@ -385,11 +399,12 @@ def check_idle(
         _record(store, diagnosis)
         return diagnosis
 
-    anchors = [task.updated_at for task in all_tasks]
+    anchors = [task.updated_at for task in free_ready]
     last_activity = _last_activity_at(store)
     if last_activity is not None:
         anchors.append(last_activity)
-    elapsed_minutes = (now - max(anchors)).total_seconds() / 60
+    reference = max(anchors)
+    elapsed_minutes = (now - reference).total_seconds() / 60
     if elapsed_minutes < cfg.idle_check_minutes:
         return None
 
@@ -418,21 +433,23 @@ def check_idle(
         _record(store, diagnosis)
         return diagnosis
 
-    diagnosis = IdleDiagnosis(
-        cause="unexplained",
-        detail="Tarefas READY, agente disponivel e Paperclip ok, mas nada em andamento ha mais tempo que o esperado.",
-        ready_task_ids=free_ready_ids,
-        escalated=True,
-    )
-    episode_id = hashlib.sha256(",".join(sorted(free_ready_ids)).encode("utf-8")).hexdigest()[:16]
+    episode_id = hashlib.sha256(
+        f"{reference.isoformat()}:{','.join(sorted(free_ready_ids))}".encode("utf-8")
+    ).hexdigest()[:16]
 
     def escalate(connection):
         emit_in_transaction(
             connection, EventType.DECISION_REQUIRED,
-            {"kind": "idle_stall", "cause": diagnosis.cause, "ready_task_ids": list(free_ready_ids)},
+            {"kind": "idle_stall", "cause": "unexplained", "ready_task_ids": list(free_ready_ids)},
             correlation_id=episode_id, created_at=now,
         )
 
-    store.run_sync_once(f"idle_escalation:{episode_id}", now.isoformat(), escalate)
+    newly_escalated = store.run_sync_once(f"idle_escalation:{episode_id}", now.isoformat(), escalate)
+    diagnosis = IdleDiagnosis(
+        cause="unexplained",
+        detail="Tarefas READY, agente disponivel e Paperclip ok, mas nada em andamento ha mais tempo que o esperado.",
+        ready_task_ids=free_ready_ids,
+        escalated=newly_escalated,
+    )
     _record(store, diagnosis)
     return diagnosis
