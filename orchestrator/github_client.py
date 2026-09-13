@@ -266,6 +266,28 @@ class GitHubClient:
         except sqlite3.Error:
             return {'available': False, 'reason': 'local_persistence_error', 'pending': True}
 
+    def update_issue_body(self, repo: str, issue_number: int, body: str) -> dict:
+        """Replaces an existing Issue's body wholesale (#23's own need:
+        backfilling BLOCKS once a dependent's number becomes known).
+        Naturally idempotent - the caller always sends the full desired
+        body, so repeating the same call is a no-op PATCH, not a
+        duplicate write; no local bookkeeping needed here, unlike
+        create_issue's dedup problem."""
+        try:
+            repo = _repo(repo)
+            if type(issue_number) is not int or issue_number <= 0:
+                raise ValueError('invalid issue number')
+            if not isinstance(body, str):
+                raise ValueError('invalid body')
+            issue = self._api('PATCH', f'repos/{repo}/issues/{issue_number}', {'body': body})
+            if not _valid_issue(issue):
+                raise _Failure('invalid_updated_issue')
+            return {'available': True, 'number': issue['number']}
+        except ValueError:
+            return {'available': False, 'reason': 'invalid_update_input'}
+        except _Failure as error:
+            return {'available': False, 'reason': error.reason, 'retryable': error.retryable}
+
     def _defer(self, key: str, owner: str, error: _Failure, attempts: int) -> dict:
         delay = min(self.max_backoff, self.base_backoff * 2 ** min(attempts - 1, 30))
         next_attempt = max(self._now().timestamp() + delay, error.retry_at or 0)
