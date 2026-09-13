@@ -18,7 +18,7 @@ import pytest
 import orchestrator.paperclip_ops as paperclip_ops
 from orchestrator.audit import query_audit
 from orchestrator.config import OrchestratorConfig
-from orchestrator.decisions import create_pending_decision
+from orchestrator.decisions import _decision_ref, create_pending_decision
 from orchestrator.events import EventType, emit, query_events
 from orchestrator.github_client import GitHubClient
 from orchestrator.merge_policy import MergeOutcome, try_auto_merge
@@ -152,6 +152,37 @@ def test_paperclip_then_github_crash_recovers_without_duplicating(tmp_path, monk
 
 # --- Scenario 2: crash right after a Telegram send is CONFIRMED, before ---
 # --- the caller records that it happened -----------------------------------
+
+def test_pre_upgrade_confirmed_delivery_is_not_resent(tmp_path, monkeypatch):
+    # Round-3 finding: a decision confirmed under the PREVIOUS design (a
+    # plain idempotency_keys row, kind "decision_telegram_send", written
+    # by the pre-#136 create_pending_decision) must be recognized and
+    # migrated, not silently resent just because the storage format
+    # changed underneath it on upgrade.
+    db_path = tmp_path / "state.db"
+    store = Store(db_path)
+    task = Task(title="Precisa decidir", objective="obj", project_id="hub")
+    message = "mesma decisao"
+    correlation_id = f"{task.correlation_id}:{_decision_ref(task, message)}"
+    store.save_decision(correlation_id=correlation_id, task_id=task.id, message=message)
+    store.record_idempotency_key(correlation_id, "decision_telegram_send")
+    store.close()
+
+    sent = []
+
+    def fake_send(message, config=None, post_fn=None, *, store=None):
+        sent.append(message)
+        return True, None
+
+    monkeypatch.setattr("orchestrator.decisions.send_control_message", fake_send)
+
+    reopened = Store(db_path)
+    result = create_pending_decision(task, message, reopened, correlation_id=correlation_id)
+
+    assert result == (True, None)
+    assert sent == []  # never resent - the pre-upgrade confirmation stands
+    reopened.close()
+
 
 def test_telegram_decision_send_is_not_duplicated_on_retry(tmp_path, monkeypatch):
     store = Store(tmp_path / "state.db")
