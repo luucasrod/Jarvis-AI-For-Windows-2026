@@ -12,7 +12,12 @@ from orchestrator.models import AgentClass, ExecutionMode, Task, TaskState
 from orchestrator.persistence import Store
 from orchestrator.planner import PlanResult
 from orchestrator.project_resolver import ProjectContext
-from orchestrator.task_queue import _resolve_fallback_path, _uses_github_issues, materialize_plan
+from orchestrator.task_queue import (
+    _resolve_fallback_path,
+    _uses_github_issues,
+    list_incomplete_relationships,
+    materialize_plan,
+)
 
 
 class Clock:
@@ -466,4 +471,100 @@ def test_fallback_defers_dependent_of_needs_lucas_task(tmp_path):
     content = fila.read_text(encoding="utf-8")
     assert "Needs a human" not in content
     assert "Waits on human decision" not in content
+    store.close()
+
+
+# --- Regressions from Codex's round-3 review (Review Task #117) -----------
+
+def test_concurrent_fallback_writers_never_duplicate_the_same_task(tmp_path):
+    # Regression (finding #1): two connections both reading "not written
+    # yet" before either commits its append used to duplicate the entry.
+    # The whole read-check-append-record sequence now runs inside one
+    # SQLite transaction (BEGIN IMMEDIATE), which genuinely serializes
+    # concurrent connections sharing the same db file.
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    db_path = tmp_path / 'state.db'
+    (tmp_path / "docs" / "ai").mkdir(parents=True)
+    fila = tmp_path / "docs" / "ai" / "FILA.md"
+    fila.write_text("# Fila existente\n", encoding="utf-8")
+    project = ProjectContext(canonical_id="pdr", root=str(tmp_path), task_source=FILA_PROJECT.task_source)
+    task = _task(title="Concurrent fallback task")
+    plan_result = PlanResult(tasks=[task])
+
+    setup_store = Store(db_path)
+    setup_store.close()
+    stores = [Store(db_path) for _ in range(4)]
+    barrier = Barrier(4)
+
+    def write(store):
+        barrier.wait(timeout=5)
+        materialize_plan(plan_result, project, store, client=None)
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(write, stores))
+    finally:
+        for store in stores:
+            store.close()
+
+    content = fila.read_text(encoding="utf-8")
+    assert content.count("Concurrent fallback task") == 1
+
+
+def test_blocks_backfill_preserves_pre_existing_unrelated_relationships(setup):
+    # Regression (finding #2): the round-2 fix preserved everything
+    # OUTSIDE the RELATIONSHIPS section, but still overwrote BOTH
+    # relationship lines from this batch's own bookkeeping alone -
+    # destroying a BLOCKED_BY/BLOCKS reference this batch has no
+    # knowledge of (a parent title-deduplicated by #17 onto a pre-
+    # existing Issue, or one a human edited after creation).
+    store, github, client = setup
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    # Simulate #17 deduplicating "Base work" (by title) onto a pre-
+    # existing Issue #50 that already has unrelated relationships this
+    # batch knows nothing about. A distinct, high number avoids
+    # colliding with the fake's own auto-numbering for freshly-posted
+    # issues (len(posts)+1).
+    github.issues.append({
+        'number': 50, 'title': 'Base work',
+        'body': 'Pre-existing issue.\n\n## RELATIONSHIPS\nBLOCKED_BY: #99\nBLOCKS: #98\n',
+        'state': 'open',
+    })
+
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    base_issue = next(issue for issue in github.issues if issue['number'] == 50)
+    assert "BLOCKED_BY: #99" in base_issue['body']  # preserved, not erased
+    assert "#98" in base_issue['body']  # preserved
+    blocks_line = next(line for line in base_issue['body'].splitlines() if line.startswith("BLOCKS:"))
+    assert "#98" in blocks_line and "#1" in blocks_line  # unioned, not replaced
+
+
+def test_incomplete_relationship_backfill_is_queryable_for_retry(tmp_path):
+    # Regression (finding #3): a log entry alone isn't a contract a
+    # caller can act on - list_incomplete_relationships() gives a
+    # durable, queryable record of exactly what still needs repair.
+    store = Store(tmp_path / 'state.db')
+    github = GitHub(patch_error="server error")
+    client = GitHubClient(store, config=OrchestratorConfig(retry_interval_seconds=10),
+                          run_fn=github.run, clock=Clock(), timeout_seconds=5)
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    incomplete = list_incomplete_relationships(store)
+    assert len(incomplete) == 1
+    assert incomplete[0]['repo'] == 'owner/repo'
+    assert incomplete[0]['issue_number'] == 1
+    assert incomplete[0]['correlation_id'] == base.correlation_id
+
+    assert list_incomplete_relationships(store, repo='owner/repo') == incomplete
+    assert list_incomplete_relationships(store, repo='someone/else') == []
     store.close()
