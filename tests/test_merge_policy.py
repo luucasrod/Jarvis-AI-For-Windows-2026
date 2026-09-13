@@ -61,10 +61,10 @@ def _fail_review(store, task):
     emit(store, EventType.REVIEW_FAILED, {"task_id": task.id}, correlation_id=task.correlation_id)
 
 
-def _merge(task, store, **overrides):
+def _merge(task, store, *, repo=REPO, **overrides):
     kwargs = dict(expected_head_sha=HEAD, expected_base=BASE, required_checks=["pytest"])
     kwargs.update(overrides)
-    return try_auto_merge(task, REPO, 42, store, **kwargs)
+    return try_auto_merge(task, repo, 42, store, **kwargs)
 
 
 @pytest.fixture
@@ -292,6 +292,28 @@ def test_calling_twice_on_already_merged_reconciles_once_then_is_idempotent(stor
     assert first == MergeOutcome(merged=True, reason="merged", already_merged=False)
     assert second == MergeOutcome(merged=True, reason="already_merged", already_merged=True)
     assert len(query_events(store, event_types=[EventType.MERGE_COMPLETED])) == 1
+    store.close()
+
+
+def test_repo_case_does_not_duplicate_merge_completion(store, task):
+    # Regression (Review Task #111 round 4): _review_passed compares repo
+    # case-insensitively, but the idempotency key and the recorded
+    # event/audit used the caller's raw casing. Calling with "org/repo"
+    # then "Org/Repo" for the SAME PR/head - both authorized by the same
+    # PASS - used to build two distinct run_sync_once keys and record two
+    # MERGE_COMPLETED events + two success audits for one real merge.
+    _pass_review(store, task, repo=REPO)
+
+    def run_fn(args, **kwargs):
+        return _Result(stdout=_view_json(state="MERGED"))
+
+    first = _merge(task, store, repo="org/repo", run_fn=run_fn)
+    second = _merge(task, store, repo="Org/Repo", run_fn=run_fn)
+    assert first == MergeOutcome(merged=True, reason="merged", already_merged=False)
+    assert second == MergeOutcome(merged=True, reason="already_merged", already_merged=True)
+    assert len(query_events(store, event_types=[EventType.MERGE_COMPLETED])) == 1
+    success_entries = [e for e in query_audit(store) if e["result"] == "success"]
+    assert len(success_entries) == 1
     store.close()
 
 

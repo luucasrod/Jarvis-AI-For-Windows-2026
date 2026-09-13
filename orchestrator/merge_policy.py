@@ -211,6 +211,14 @@ def try_auto_merge(
     can observe a completed merge - gets there first.
     """
     run = run_fn or subprocess.run
+    # Canonicalized ONCE here (consistent with #17's own GitHubClient._repo)
+    # and used for every query/key/event/audit/CLI call below - #37 round 4
+    # finding: _review_passed compared repo case-insensitively, but the
+    # idempotency key and recorded event/audit still used the caller's raw
+    # casing, so calling with "org/repo" then "Org/Repo" for the same
+    # PR/head (both authorized by the same PASS) produced two distinct
+    # run_sync_once keys and duplicated MERGE_COMPLETED + success audits.
+    repo = repo.lower()
 
     def _fail(reason: str, *, result: str = "skipped") -> MergeOutcome:
         outcome = MergeOutcome(merged=False, reason=reason)
