@@ -175,6 +175,30 @@ def test_same_task_set_stalling_again_after_real_activity_escalates_again(tmp_pa
     store.close()
 
 
+def test_new_ready_task_does_not_mask_an_old_stalled_ready_task(tmp_path):
+    # Regression (Review Task #113, round 3): gating on the MOST RECENT
+    # updated_at among free/ready tasks meant a steady trickle of new
+    # arrivals could mask an old, genuinely stalled task forever. Repro
+    # from the review: Old READY at 10:00, New READY at 10:16, no
+    # activity/IN_PROGRESS, check at 10:16 must still catch the old one.
+    store = Store(tmp_path / "state.db")
+    clock = Clock("2026-09-12T10:00:00+00:00")
+    old = _task(updated_at=clock(), title="Old stalled work")
+    store.save_task(old)
+
+    clock.set("2026-09-12T10:16:00+00:00")
+    fresh = _task(updated_at=clock(), title="Brand new work")
+    store.save_task(fresh)
+
+    diagnosis = check_idle(store, config=CONFIG, clock=clock, paperclip_available=lambda: True,
+                           paperclip_snapshot=lambda: NO_PAUSED_AGENTS)
+
+    assert diagnosis is not None
+    assert diagnosis.cause == "unexplained"
+    assert diagnosis.ready_task_ids == (old.id,)
+    store.close()
+
+
 def test_unrelated_blocked_task_activity_does_not_mask_a_stale_free_task(tmp_path):
     # Regression (Review Task #113, round 2, finding #2): the anchor used
     # to include EVERY task's updated_at - touching an unrelated BLOCKED
