@@ -120,7 +120,21 @@ def create_pending_decision(
     (idempotent - no duplicate row), since the hash is deterministic."""
     correlation_id = correlation_id or f"{task.correlation_id}:{_decision_ref(task, message)}"
     store.save_decision(correlation_id=correlation_id, task_id=task.id, message=message)
-    return send_control_message(message)
+    # Idempotency (issue #41): a caller retrying this exact decision (crash,
+    # or an ambiguous outcome, right after a PREVIOUS call already sent it)
+    # must not resend a CONFIRMED delivery - unlike GitHub Issues/Paperclip
+    # tasks, Telegram has no server-side dedup and no "was this already
+    # sent?" query to reconcile against. The key is recorded ONLY after a
+    # CONFIRMED send, so a previously FAILED attempt (offline, timeout, a
+    # never-attempted first call) still retries normally - only a
+    # proven-delivered message is ever skipped.
+    kind = "decision_telegram_send"
+    if store.has_idempotency_key(correlation_id, kind):
+        return True, None
+    ok, error = send_control_message(message, store=store)
+    if ok:
+        store.record_idempotency_key(correlation_id, kind)
+    return ok, error
 
 
 def notify_needs_lucas(
