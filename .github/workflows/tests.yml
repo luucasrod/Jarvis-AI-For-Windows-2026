@@ -5,6 +5,15 @@ on:
   pull_request:
 
 jobs:
+  windows-process-commands:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - run: python -m pytest tests/test_process_commands.py -q
   pytest:
     runs-on: ubuntu-latest
     steps:

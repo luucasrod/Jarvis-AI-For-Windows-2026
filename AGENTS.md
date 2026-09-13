@@ -69,9 +69,10 @@ execute o mesmo comando novamente. Nao mate todos os processos Python: outros
 agentes e ferramentas podem estar usando-os. Para uma instancia oculta, identifique
 primeiro o processo correto usando `.jarvis.pid` e sua linha de comando.
 
-Nao ha script de servico start/stop/restart versionado nesta base; a issue #42
-trata desse empacotamento. Atalhos `.bat` existentes apenas na maquina nao sao
-parte da instalacao reproduzivel do repositorio.
+Os atalhos Iniciar/Parar/Reiniciar/Status/Logs_Jarvis.bat usam comandos nativos
+de processo, documentados em [PROCESS_COMMANDS.md](docs/ai/PROCESS_COMMANDS.md).
+Feche o launcher antigo com loop antes da adocao. Nao ha servico ou inicio
+automatico no logon instalado por esses comandos.
 
 ## Validacao e entrega
 
