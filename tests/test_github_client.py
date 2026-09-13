@@ -26,8 +26,8 @@ class Clock:
 
 class GitHub:
     def __init__(self):
-        self.issues, self.calls, self.posts = [], [], []
-        self.read_error = self.post_error = None
+        self.issues, self.calls, self.posts, self.patches = [], [], [], []
+        self.read_error = self.post_error = self.patch_error = None
         self.lose_reply = False
         self.pages = None
     def run(self, args, **kwargs):
@@ -40,6 +40,18 @@ class GitHub:
             if self.read_error:
                 return subprocess.CompletedProcess(args, 1, '', self.read_error)
             return subprocess.CompletedProcess(args, 0, json.dumps(self.pages if self.pages is not None else [self.issues]), '')
+        if method == 'PATCH':
+            endpoint = args[args.index('--method') + 2]
+            number = int(endpoint.rsplit('/', 1)[-1])
+            body = json.loads(kwargs['input'])
+            self.patches.append(body)
+            if self.patch_error:
+                return subprocess.CompletedProcess(args, 1, '', self.patch_error)
+            for issue in self.issues:
+                if issue['number'] == number:
+                    issue['body'] = body['body']
+                    return subprocess.CompletedProcess(args, 0, json.dumps(issue), '')
+            return subprocess.CompletedProcess(args, 1, '', 'not found')
         body = json.loads(kwargs['input'])
         self.posts.append(body)
         if self.post_error:
@@ -296,3 +308,43 @@ def test_validation_rejection_is_persisted_without_retry_storm(setup):
     clock.advance(10000)
     assert client.retry_pending() == []
     assert store.query('SELECT status FROM pending_github_ops')[0][0] == 'failed'
+
+
+# --- update_issue_body (added for #23's BLOCKS backfill) -------------------
+
+def test_update_issue_body_replaces_body(setup):
+    store, clock, github, client = setup
+    create(client)
+    result = client.update_issue_body('Owner/Repo', 1, 'new body')
+    assert result == {'available': True, 'number': 1}
+    assert github.issues[0]['body'] == 'new body'
+    assert github.patches == [{'body': 'new body'}]
+
+
+def test_update_issue_body_repeated_call_is_a_no_op_not_a_duplicate(setup):
+    store, clock, github, client = setup
+    create(client)
+    client.update_issue_body('Owner/Repo', 1, 'new body')
+    client.update_issue_body('Owner/Repo', 1, 'new body')
+    assert len(github.patches) == 2  # both PATCH calls happen...
+    assert github.issues[0]['body'] == 'new body'  # ...but the result is identical, not cumulative
+
+
+@pytest.mark.parametrize('changes', [{'issue_number': 0}, {'issue_number': -1}, {'issue_number': 'x'},
+                                     {'issue_number': True}, {'body': None}, {'repo': '../repo'}])
+def test_update_issue_body_rejects_invalid_input(setup, changes):
+    store, clock, github, client = setup
+    kwargs = dict(repo='Owner/Repo', issue_number=1, body='x')
+    kwargs.update(changes)
+    result = client.update_issue_body(**kwargs)
+    assert result == {'available': False, 'reason': 'invalid_update_input'}
+    assert github.patches == []
+
+
+def test_update_issue_body_reports_transport_failure(setup):
+    store, clock, github, client = setup
+    create(client)
+    github.patch_error = 'server error'
+    result = client.update_issue_body('Owner/Repo', 1, 'new body')
+    assert result['available'] is False
+    assert github.issues[0]['body'] != 'new body'
