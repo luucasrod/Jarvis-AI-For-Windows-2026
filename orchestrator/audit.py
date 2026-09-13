@@ -68,7 +68,6 @@ def record(
     extra: dict | None = None,
 ) -> None:
     _ensure_table(store)
-    safe_extra = _redact_secrets(extra or {})
     store.execute(
         "INSERT INTO audit_log (action, project_id, origin, result, correlation_id, extra, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -78,8 +77,42 @@ def record(
             origin,
             result,
             correlation_id,
-            json.dumps(safe_extra),
+            json.dumps(_redact_secrets(extra or {})),
             datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
+def record_in_transaction(
+    connection,
+    action: str,
+    origin: str,
+    result: str,
+    project_id: str | None = None,
+    correlation_id: str | None = None,
+    extra: dict | None = None,
+    *,
+    created_at: datetime | None = None,
+) -> None:
+    """Append inside a caller-owned transaction without committing it -
+    mirrors events.emit_in_transaction (#25). Added for #37's merge
+    completion: the audit record of a merge and the MERGE_COMPLETED event
+    must land atomically together (Review Task #111, finding #2 - a
+    crash between two separate, non-transactional writes could silently
+    lose the audit trail even when the event itself was recorded, or
+    vice versa)."""
+    connection.execute(_SCHEMA)
+    connection.execute(
+        "INSERT INTO audit_log (action, project_id, origin, result, correlation_id, extra, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            action,
+            project_id,
+            origin,
+            result,
+            correlation_id,
+            json.dumps(_redact_secrets(extra or {})),
+            (created_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
         ),
     )
 

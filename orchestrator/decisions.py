@@ -18,6 +18,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
@@ -30,6 +31,98 @@ from orchestrator.task_queue import get_promotable_tasks
 from orchestrator.telegram_bot import send_control_message
 
 _OPTION_LETTERS = "ABCDEFGHIJ"
+
+_DELIVERY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS decision_deliveries (
+    correlation_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    confirmed INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# Reasons from telegram_bot._send_message that mean the message was
+# PROVABLY never accepted (bad config, bad token, bad chat/content) -
+# these are safe to retry for real. Everything else (offline, timeout,
+# a 5xx, a malformed/unconfirmed response) is left UNCERTAIN: Telegram
+# gives no way to ask "was this specific message already delivered?", so
+# per Review Task #133 round 2 an uncertain outcome is never silently
+# retried - the caller gets a distinct, explicit result instead.
+_DEFINITELY_NOT_SENT_PREFIXES = (
+    "Telegram nao configurado", "token invalido", "chat_id invalido",
+)
+
+
+def _send_decision_once(store: Store, correlation_id: str, message: str) -> tuple[bool, str | None]:
+    """Sends `message` at most once for this `correlation_id`, closing the
+    crash window Review Task #133 (round 2) found in the previous
+    "record success after sending" design:
+
+    1. A claim row is reserved BEFORE any network call, inside the same
+       transaction primitive (`run_in_transaction`, BEGIN IMMEDIATE) used
+       elsewhere in this codebase as a real cross-connection lock (#26/#28/
+       #23's own fallback queue). Two concurrent callers for the same
+       correlation_id can no longer both pass a check-then-send race
+       (round-2 finding #3): only the one whose owner wins the INSERT OR
+       IGNORE proceeds to send at all.
+    2. A caller that finds an EXISTING, unconfirmed claim owned by someone
+       else (a concurrent call, OR an earlier attempt that crashed/reopened
+       the Store before confirming) never resends - the outcome of that
+       earlier attempt is unknown and Telegram has no reconciliation query
+       (round-2 finding #1: the previous design only recorded the key
+       AFTER a confirmed send, leaving a real window where a crash between
+       "Telegram accepted it" and "we recorded that" caused a genuine
+       retry to resend). This trades "might occasionally leave a decision
+       stuck as uncertain" for "never knowingly duplicates" - the
+       documented, conservative choice Review Task #133 asked for, matching
+       how an uncertain Paperclip/GitHub creation is surfaced rather than
+       blindly retried.
+    3. Only a reason PROVABLY unrelated to whether Telegram received the
+       message (config missing, bad token, bad chat) releases the claim so
+       a real retry can happen - a timeout or malformed response (round-2
+       finding #2) leaves the claim in place, uncertain, forever (until a
+       caller passes a fresh correlation_id on purpose).
+    """
+    store.ensure_schema(_DELIVERY_SCHEMA)
+    owner = str(uuid.uuid4())
+
+    def claim(connection: sqlite3.Connection):
+        connection.execute(
+            "INSERT OR IGNORE INTO decision_deliveries (correlation_id, owner, confirmed) VALUES (?, ?, 0)",
+            (correlation_id, owner),
+        )
+        return connection.execute(
+            "SELECT owner, confirmed FROM decision_deliveries WHERE correlation_id = ?",
+            (correlation_id,),
+        ).fetchone()
+
+    claimed_owner, confirmed = store.run_in_transaction(claim)
+    if confirmed:
+        return True, None
+    if claimed_owner != owner:
+        return False, (
+            "entrega incerta - uma tentativa anterior ou concorrente desta "
+            "mesma decisao ainda nao foi confirmada; verifique manualmente "
+            "antes de tentar de novo"
+        )
+
+    ok, error = send_control_message(message, store=store)
+    if ok:
+        def confirm(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "UPDATE decision_deliveries SET confirmed = 1 WHERE correlation_id = ? AND owner = ?",
+                (correlation_id, owner),
+            )
+        store.run_in_transaction(confirm)
+        return True, None
+
+    if error is not None and error.startswith(_DEFINITELY_NOT_SENT_PREFIXES):
+        def release(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "DELETE FROM decision_deliveries WHERE correlation_id = ? AND owner = ? AND confirmed = 0",
+                (correlation_id, owner),
+            )
+        store.run_in_transaction(release)
+    return ok, error
 
 
 def _decision_ref(task: Task, basis: str) -> str:
@@ -120,7 +213,7 @@ def create_pending_decision(
     (idempotent - no duplicate row), since the hash is deterministic."""
     correlation_id = correlation_id or f"{task.correlation_id}:{_decision_ref(task, message)}"
     store.save_decision(correlation_id=correlation_id, task_id=task.id, message=message)
-    return send_control_message(message)
+    return _send_decision_once(store, correlation_id, message)
 
 
 def notify_needs_lucas(
