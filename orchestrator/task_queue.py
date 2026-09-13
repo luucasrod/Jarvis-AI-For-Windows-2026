@@ -14,6 +14,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from datetime import datetime, timezone
+
+from orchestrator.audit import query_audit
 from orchestrator.audit import record as audit_record
 from orchestrator.github_client import GitHubClient
 from orchestrator.models import Task, TaskState
@@ -169,6 +172,8 @@ def _analyze_batch(tasks: list[Task], store: Store) -> tuple[list[Task], set[str
 _RELATIONSHIPS_SECTION = re.compile(
     r"\n?## RELATIONSHIPS\n(?:BLOCKED_BY:.*\n?)?(?:BLOCKS:.*\n?)?", re.IGNORECASE,
 )
+_RELATIONSHIP_LINE = re.compile(r"^(BLOCKED_BY|BLOCKS):\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+_ISSUE_NUMBER_REF = re.compile(r"#(\d+)")
 
 
 def _relationships_block(blocked_by_numbers: list[int], blocks_numbers: list[int]) -> str:
@@ -189,18 +194,45 @@ def _issue_body(task: Task, blocked_by_numbers: list[int], blocks_numbers: list[
     return "\n".join(lines)
 
 
-def _patch_relationships(existing_body: str, blocked_by_numbers: list[int], blocks_numbers: list[int]) -> str:
-    """Replaces ONLY the RELATIONSHIPS section of an already-created
-    Issue's CURRENT body, preserving everything else - #17's own
-    jarvis-correlation marker, the objective/acceptance-criteria text,
-    and any human edits or content from a title-deduplicated pre-existing
-    Issue. Regenerating the whole body (as the first version of this
-    backfill did) silently erased the correlation marker, breaking #17's
-    own dedup on any later replay (Review Task #117 round 2, finding #3).
-    A body with no recognizable RELATIONSHIPS section (unexpected shape -
-    a human-authored issue, say) gets the section appended rather than
-    risk rewriting content whose structure isn't understood."""
-    new_section = _relationships_block(blocked_by_numbers, blocks_numbers)
+def _existing_relationship_numbers(existing_body: str) -> tuple[list[int], list[int]]:
+    """Parses whatever BLOCKED_BY/BLOCKS numbers are already in the
+    Issue's CURRENT body - independent of this batch's own bookkeeping,
+    so a relationship this batch knows nothing about (a human edit, a
+    reference from a completely different plan) is never silently lost."""
+    section = _RELATIONSHIPS_SECTION.search(existing_body)
+    if not section:
+        return [], []
+    blocked_by: list[int] = []
+    blocks: list[int] = []
+    for line_match in _RELATIONSHIP_LINE.finditer(section.group(0)):
+        numbers = [int(n) for n in _ISSUE_NUMBER_REF.findall(line_match.group(2))]
+        if line_match.group(1).upper() == "BLOCKED_BY":
+            blocked_by = numbers
+        else:
+            blocks = numbers
+    return blocked_by, blocks
+
+
+def _patch_relationships(existing_body: str, new_blocks_numbers: list[int]) -> str:
+    """Adds `new_blocks_numbers` to the Issue's CURRENT BLOCKS list -
+    never a wholesale rewrite of the RELATIONSHIPS section. The first two
+    versions of this backfill each destroyed something outside this
+    batch's own knowledge: v1 regenerated the whole body (erasing #17's
+    correlation marker and any human content, round 2 finding #3); v2
+    preserved the rest of the body but still overwrote BOTH relationship
+    lines from this batch's OWN bookkeeping alone, discarding a
+    pre-existing BLOCKED_BY/BLOCKS this batch has no knowledge of - e.g.
+    a parent Issue #17 deduplicated by title, or one a human edited after
+    creation (Review Task #117 round 3, finding #2). BLOCKED_BY here is
+    therefore left exactly as already written (never recomputed by a
+    BLOCKS-only backfill), and the new BLOCKS numbers are UNIONED with
+    whatever was already listed, never replacing it. A body with no
+    recognizable RELATIONSHIPS section (unexpected shape - a human-
+    authored issue, say) gets the section appended rather than risk
+    rewriting content whose structure isn't understood."""
+    existing_blocked_by, existing_blocks = _existing_relationship_numbers(existing_body)
+    merged_blocks = sorted(set(existing_blocks) | set(new_blocks_numbers))
+    new_section = _relationships_block(existing_blocked_by, merged_blocks)
     if _RELATIONSHIPS_SECTION.search(existing_body):
         return _RELATIONSHIPS_SECTION.sub("\n" + new_section, existing_body, count=1)
     separator = "" if not existing_body else ("\n\n" if not existing_body.endswith("\n\n") else "")
@@ -271,25 +303,57 @@ def _materialize_to_github(
             current = current_by_number.get(parent_number)
             if current is None:
                 # Can't safely patch without reading the real current body
-                # first - reported as an incomplete relationship rather
-                # than silently guessed at or overwritten blind.
-                audit_record(
-                    store, action="materialize_relationships", origin="task_queue", result="incomplete",
-                    correlation_id=parent.correlation_id, project_id=parent.project_id,
-                    extra={"issue_number": parent_number, "reason": "current_body_unavailable"},
-                )
+                # first - recorded as a queryable incomplete relationship
+                # (see list_incomplete_relationships) rather than silently
+                # guessed at or overwritten blind.
+                _record_incomplete_relationship(store, project_context.repository, parent, parent_number,
+                                                "current_body_unavailable")
                 continue
-            blocked_by_numbers = [task_to_issue[dep_id] for dep_id in parent.dependencies if dep_id in task_to_issue]
-            new_body = _patch_relationships(current.get("body") or "", blocked_by_numbers, sorted(blocks_numbers))
+            new_body = _patch_relationships(current.get("body") or "", sorted(blocks_numbers))
             result = client.update_issue_body(project_context.repository, parent_number, new_body)
             if not result.get("available"):
-                audit_record(
-                    store, action="materialize_relationships", origin="task_queue", result="incomplete",
-                    correlation_id=parent.correlation_id, project_id=parent.project_id,
-                    extra={"issue_number": parent_number, "reason": result.get("reason")},
-                )
+                _record_incomplete_relationship(store, project_context.repository, parent, parent_number,
+                                                result.get("reason"))
 
     return created
+
+
+_INCOMPLETE_RELATIONSHIP_ACTION = "materialize_relationships"
+
+
+def _record_incomplete_relationship(store: Store, repo: str, parent: Task, issue_number: int, reason) -> None:
+    audit_record(
+        store, action=_INCOMPLETE_RELATIONSHIP_ACTION, origin="task_queue", result="incomplete",
+        correlation_id=parent.correlation_id, project_id=parent.project_id,
+        extra={"repo": repo, "issue_number": issue_number, "reason": reason},
+    )
+
+
+def list_incomplete_relationships(store: Store, repo: str | None = None) -> list[dict]:
+    """Returns every BLOCKS backfill that never completed (Review Task
+    #117 round 3, finding #3: a log entry alone is evidence, not a
+    contract a caller can act on) - a durable, queryable record of
+    exactly which (repo, issue_number, correlation_id, reason) still
+    needs its relationships repaired, for a future retry pass to consume.
+    This module doesn't retry automatically - no runtime currently calls
+    materialize_plan on a recurring schedule that could safely re-run
+    just the repair - but the record is real and actionable, not merely
+    logged prose."""
+    entries = query_audit(store, project_id=None)
+    incomplete = [
+        {
+            "repo": entry["extra"].get("repo"),
+            "issue_number": entry["extra"].get("issue_number"),
+            "correlation_id": entry["correlation_id"],
+            "reason": entry["extra"].get("reason"),
+            "created_at": entry["created_at"],
+        }
+        for entry in entries
+        if entry["action"] == _INCOMPLETE_RELATIONSHIP_ACTION and entry["result"] == "incomplete"
+    ]
+    if repo is not None:
+        incomplete = [item for item in incomplete if item["repo"] == repo]
+    return incomplete
 
 
 def _fallback_marker(correlation_id: str) -> str:
@@ -313,19 +377,24 @@ def _materialize_to_fallback(tasks: list[Task], path: Path, store: Store) -> Non
     """Appends never-before-written tasks to the project's own queue file.
 
     Each written line carries a `jarvis-correlation` marker (same idea as
-    #17's own Issue-body marker). Before appending, the file's CURRENT
-    content is read and any task whose marker is already present is
-    skipped - this is the authority a replay checks, not just #13's
-    idempotency_keys table (kept as a secondary, faster guard). A crash
-    between the file write succeeding and the key being recorded used to
-    duplicate the entry on the next replay (Review Task #117 round 2,
-    finding #2, reproduced by injecting a failure right at that write);
-    re-scanning the file's actual text closes that window, since the
-    marker is already there in the file the moment the append itself
-    lands, regardless of whether the DB write after it ever completes.
-    Concurrent writers appending to the same local file are still not
-    coordinated (no locking) - out of this fix's scope, disclosed rather
-    than silently assumed away.
+    #17's own Issue-body marker) - the authority a replay checks, not
+    just #13's idempotency_keys table (kept as a secondary, faster
+    guard). Re-scanning the file's actual text (rather than trusting the
+    DB key alone) closes the crash window between a successful append and
+    the key being recorded (Review Task #117 round 2, finding #2).
+
+    The whole read-check-append-record sequence runs inside one
+    `run_in_transaction`: SQLite's BEGIN IMMEDIATE takes a real write lock
+    that blocks a SECOND connection's own call to this function until the
+    first one commits - a plain re-read without that lock left a window
+    where two concurrent writers could both see "not written yet" and
+    both append, duplicating the entry (Review Task #117 round 3, finding
+    #1, reproduced with two coordinated connections). The lock only
+    covers the DURATION of this callback, not the file's own atomicity
+    guarantees - two Jarvis processes/threads sharing the same Store
+    (the only writers this codebase has) are correctly serialized; an
+    entirely separate, uncoordinated process writing to the same path
+    outside this module is not this function's concern.
     """
     by_id = {task.id: task for task in tasks}
     ordered, deferred = _analyze_batch(tasks, store)
@@ -334,25 +403,35 @@ def _materialize_to_fallback(tasks: list[Task], path: Path, store: Store) -> Non
     if not candidates:
         return
 
-    try:
-        existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
-    except OSError:
-        return
+    def apply(connection) -> None:
+        try:
+            existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            return
 
-    pending = [
-        task for task in candidates
-        if _fallback_marker(task.correlation_id) not in existing_text
-        and not store.has_idempotency_key(task.correlation_id, kind)
-    ]
-    if not pending:
-        return
-    try:
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write("\n" + _format_fallback_block(pending, by_id))
-    except OSError:
-        return
-    for task in pending:
-        store.record_idempotency_key(task.correlation_id, kind)
+        pending = [
+            task for task in candidates
+            if _fallback_marker(task.correlation_id) not in existing_text
+            and not connection.execute(
+                "SELECT 1 FROM idempotency_keys WHERE correlation_id = ? AND kind = ?",
+                (task.correlation_id, kind),
+            ).fetchone()
+        ]
+        if not pending:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("\n" + _format_fallback_block(pending, by_id))
+        except OSError:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        for task in pending:
+            connection.execute(
+                "INSERT OR IGNORE INTO idempotency_keys (correlation_id, kind, created_at) VALUES (?, ?, ?)",
+                (task.correlation_id, kind, now),
+            )
+
+    store.run_in_transaction(apply)
 
 
 def materialize_plan(
