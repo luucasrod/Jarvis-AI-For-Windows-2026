@@ -9,7 +9,9 @@ locally rather than imported from other test files, matching this
 codebase's existing convention (see test_task_materialize.py's own note).
 """
 import json
+import sqlite3
 import subprocess
+import threading
 
 import pytest
 
@@ -108,6 +110,46 @@ def test_github_issue_then_paperclip_crash_recovers_without_duplicating(tmp_path
     store.close()
 
 
+def test_paperclip_then_github_crash_recovers_without_duplicating(tmp_path, monkeypatch):
+    # The mirror direction Review Task #133 round 2 asked for: Paperclip
+    # registration happens FIRST, then a crash before the GitHub Issue is
+    # ever created for the same task.
+    store = Store(tmp_path / "state.db")
+    task = Task(title="Do the other thing", objective="obj", project_id="hub")
+
+    transport = _FakePaperclipTransport()
+    monkeypatch.setattr(paperclip_ops.client, 'list_company_tasks', transport.list_company_tasks)
+    monkeypatch.setattr(paperclip_ops.client, 'create_task', transport.create_task)
+
+    result = create_task_idempotent(
+        "acme", task.title, task.objective, task.correlation_id, store=store, config=OrchestratorConfig(),
+    )
+    assert result["available"] is True
+    assert len(transport.tasks) == 1
+    # Simulated crash HERE: process restarts before the GitHub Issue is
+    # ever created for this task.
+
+    github = _FakeGitHub()
+    gh_client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+
+    # Recovery pass: re-run the FULL sequence again.
+    result_retry = create_task_idempotent(
+        "acme", task.title, task.objective, task.correlation_id, store=store, config=OrchestratorConfig(),
+    )
+    numbers = materialize_plan(PlanResult(tasks=[task]), PROJECT, store, client=gh_client)
+
+    assert result_retry["available"] is True
+    assert len(transport.tasks) == 1  # no second Paperclip task
+    assert numbers == [1]
+    assert len(github.posts) == 1
+
+    # A SECOND retry must not create a second Issue either.
+    numbers_retry = materialize_plan(PlanResult(tasks=[task]), PROJECT, store, client=gh_client)
+    assert numbers_retry == [1]
+    assert len(github.posts) == 1
+    store.close()
+
+
 # --- Scenario 2: crash right after a Telegram send is CONFIRMED, before ---
 # --- the caller records that it happened -----------------------------------
 
@@ -133,9 +175,10 @@ def test_telegram_decision_send_is_not_duplicated_on_retry(tmp_path, monkeypatch
     store.close()
 
 
-def test_telegram_decision_send_retries_normally_after_a_real_failure(tmp_path, monkeypatch):
-    # A previously FAILED attempt (offline, timeout, ...) must still be
-    # retried for real - only a CONFIRMED send is ever skipped.
+def test_telegram_decision_send_retries_normally_after_a_definite_failure(tmp_path, monkeypatch):
+    # A PROVABLY-not-sent failure (bad token, bad config) must still be
+    # retried for real once fixed - only a CONFIRMED send, or an UNCERTAIN
+    # one, is ever skipped.
     store = Store(tmp_path / "state.db")
     task = Task(title="Precisa decidir", objective="obj", project_id="hub")
     attempts = []
@@ -143,7 +186,7 @@ def test_telegram_decision_send_retries_normally_after_a_real_failure(tmp_path, 
     def flaky_send(message, config=None, post_fn=None, *, store=None):
         attempts.append(message)
         if len(attempts) == 1:
-            return False, "offline"
+            return False, "token invalido"
         return True, None
 
     monkeypatch.setattr("orchestrator.decisions.send_control_message", flaky_send)
@@ -151,10 +194,113 @@ def test_telegram_decision_send_retries_normally_after_a_real_failure(tmp_path, 
     first = create_pending_decision(task, "mensagem", store)
     second = create_pending_decision(task, "mensagem", store)
 
-    assert first == (False, "offline")
+    assert first == (False, "token invalido")
     assert second == (True, None)
-    assert len(attempts) == 2  # real retry after a genuine failure
+    assert len(attempts) == 2  # real retry after a provably-not-sent failure
     store.close()
+
+
+def test_telegram_uncertain_failure_is_never_auto_resent(tmp_path, monkeypatch):
+    # Round-2 finding #2: a timeout does NOT prove the message was never
+    # delivered - it must be treated as uncertain, not silently retried.
+    store = Store(tmp_path / "state.db")
+    task = Task(title="Precisa decidir", objective="obj", project_id="hub")
+    attempts = []
+
+    def flaky_send(message, config=None, post_fn=None, *, store=None):
+        attempts.append(message)
+        return False, "timeout"
+
+    monkeypatch.setattr("orchestrator.decisions.send_control_message", flaky_send)
+
+    first = create_pending_decision(task, "mensagem", store)
+    second = create_pending_decision(task, "mensagem", store)
+
+    assert first == (False, "timeout")
+    assert second[0] is False and "incerta" in second[1]
+    assert len(attempts) == 1  # never auto-resent after an uncertain outcome
+    store.close()
+
+
+def test_telegram_crash_between_confirmed_send_and_local_commit_is_never_resent(tmp_path, monkeypatch):
+    # Round-2 finding #1's exact repro: inject a failure into the record-
+    # of-success step itself, AFTER send_control_message already returned
+    # True, close the Store (simulating the crash), reopen the SAME db
+    # file as a fresh process would, and retry - must never resend.
+    db_path = tmp_path / "state.db"
+    store = Store(db_path)
+    task = Task(title="Precisa decidir", objective="obj", project_id="hub")
+    sent = []
+
+    def fake_send(message, config=None, post_fn=None, *, store=None):
+        sent.append(message)
+        return True, None
+
+    monkeypatch.setattr("orchestrator.decisions.send_control_message", fake_send)
+
+    original_run_in_transaction = store.run_in_transaction
+    calls = {"n": 0}
+
+    def crashing_run_in_transaction(operation):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1st call is the claim; 2nd is the confirm
+            raise sqlite3.OperationalError("simulated crash before commit")
+        return original_run_in_transaction(operation)
+
+    monkeypatch.setattr(store, "run_in_transaction", crashing_run_in_transaction)
+
+    with pytest.raises(sqlite3.OperationalError):
+        create_pending_decision(task, "mesma decisao", store)
+    store.close()
+
+    reopened = Store(db_path)
+    result = create_pending_decision(task, "mesma decisao", reopened)
+
+    assert len(sent) == 1  # never resent - the real gap this closes
+    assert result[0] is False and "incerta" in result[1]
+    reopened.close()
+
+
+def test_telegram_concurrent_deliveries_do_not_both_send(tmp_path, monkeypatch):
+    # Round-2 finding #3: two concurrent connections to the same db must
+    # not both pass the check and both send.
+    db_path = tmp_path / "state.db"
+    task = Task(title="Precisa decidir", objective="obj", project_id="hub")
+    sent = []
+    send_started = threading.Event()
+    release_send = threading.Event()
+
+    def fake_send(message, config=None, post_fn=None, *, store=None):
+        sent.append(message)
+        send_started.set()
+        release_send.wait(timeout=5)
+        return True, None
+
+    monkeypatch.setattr("orchestrator.decisions.send_control_message", fake_send)
+
+    store_a = Store(db_path)
+    store_b = Store(db_path)
+    results = {}
+
+    def first():
+        results["a"] = create_pending_decision(task, "mesma decisao", store_a)
+
+    def second():
+        assert send_started.wait(timeout=5)
+        results["b"] = create_pending_decision(task, "mesma decisao", store_b)
+        release_send.set()
+
+    t1 = threading.Thread(target=first)
+    t2 = threading.Thread(target=second)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert len(sent) == 1
+    assert results["b"][0] is False and "incerta" in results["b"][1]
+    store_a.close()
+    store_b.close()
 
 
 # --- Scenario 3: crash right after a merge completes, before a caller ------
@@ -178,26 +324,45 @@ def _view_json(*, state="MERGED", head=_HEAD, base=_BASE, merge_commit="deadbeef
     })
 
 
-def test_merge_completion_is_not_duplicated_after_simulated_crash_retry(tmp_path):
+def test_merge_completion_registers_exactly_once_after_confirmation_crash(tmp_path):
+    # The real boundary Review Task #133 round 2 asked for: a SINGLE remote
+    # merge happens for real (gh pr merge called exactly once), the process
+    # then fails to CONFIRM it (simulating a crash right after the remote
+    # merge succeeded, before try_auto_merge ever reaches _reconcile_merged),
+    # and a recovery pass - which must NOT attempt another remote merge -
+    # completes the local registration exactly once.
     store = Store(tmp_path / "state.db")
     task = Task(title="Fix bug", objective="obj", project_id="hub")
     emit(store, EventType.REVIEW_PASSED,
          {"task_id": task.id, "head_sha": _HEAD, "repo": _REPO, "pr_number": 42},
          correlation_id=task.correlation_id)
 
-    def run_fn(args, **kwargs):
-        return _Result(stdout=_view_json())
+    calls = {"merge": 0, "view": 0}
+
+    def crashing_run_fn(args, **kwargs):
+        if args[1:3] == ["pr", "merge"]:
+            calls["merge"] += 1
+            return _Result()
+        calls["view"] += 1
+        if calls["view"] == 1:
+            return _Result(stdout=_view_json(state="OPEN"))
+        # Confirmation view right after the real merge succeeded - the
+        # process crashes here, before _reconcile_merged ever runs.
+        return _Result(returncode=1, stderr="transport failure")
 
     first = try_auto_merge(task, _REPO, 42, store, expected_head_sha=_HEAD, expected_base=_BASE,
-                           required_checks=["pytest"], run_fn=run_fn)
-    # Simulated crash HERE: nothing yet consumes this completion to update
-    # the Task's own state (tracked separately - see follow-up), but the
-    # completion record itself must still never duplicate on retry.
-    second = try_auto_merge(task, _REPO, 42, store, expected_head_sha=_HEAD, expected_base=_BASE,
-                            required_checks=["pytest"], run_fn=run_fn)
+                           required_checks=["pytest"], run_fn=crashing_run_fn)
+    assert first.merged is False
+    assert calls["merge"] == 1  # exactly one real remote merge happened
 
-    assert first == MergeOutcome(merged=True, reason="merged", already_merged=False)
-    assert second == MergeOutcome(merged=True, reason="already_merged", already_merged=True)
+    def recovered_run_fn(args, **kwargs):
+        assert args[1:3] != ["pr", "merge"]  # recovery must never merge again
+        return _Result(stdout=_view_json(state="MERGED"))
+
+    second = try_auto_merge(task, _REPO, 42, store, expected_head_sha=_HEAD, expected_base=_BASE,
+                            required_checks=["pytest"], run_fn=recovered_run_fn)
+
+    assert second == MergeOutcome(merged=True, reason="merged", already_merged=False)
     assert len(query_events(store, event_types=[EventType.MERGE_COMPLETED])) == 1
     success_audits = [e for e in query_audit(store) if e["result"] == "success"]
     assert len(success_audits) == 1
