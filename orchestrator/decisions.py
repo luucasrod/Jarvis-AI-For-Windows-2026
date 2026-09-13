@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS decision_deliveries (
 );
 """
 
+# The `idempotency_keys` kind this module wrote BEFORE `decision_deliveries`
+# existed (PR #132's original, since-replaced design) - a row here is a
+# real confirmed send from that era and must be migrated, not ignored.
+_LEGACY_DELIVERY_KIND = "decision_telegram_send"
+
 # Reasons from telegram_bot._send_message that mean the message was
 # PROVABLY never accepted (bad config, bad token, bad chat/content) -
 # these are safe to retry for real. Everything else (offline, timeout,
@@ -81,11 +86,31 @@ def _send_decision_once(store: Store, correlation_id: str, message: str) -> tupl
        a real retry can happen - a timeout or malformed response (round-2
        finding #2) leaves the claim in place, uncertain, forever (until a
        caller passes a fresh correlation_id on purpose).
+
+    4. A confirmation from the PREVIOUS design (the plain `idempotency_keys`
+       row this same function used to write, kind `decision_telegram_send`,
+       before this claim-based table existed) is migrated into
+       `decision_deliveries` as already-confirmed INSIDE this same claim
+       transaction (round-3 finding: upgrading straight from that design
+       ignored its already-proven-sent decisions entirely and resent them)
+       - a message proven delivered under the old scheme is never resent
+       just because the storage format changed underneath it.
     """
     store.ensure_schema(_DELIVERY_SCHEMA)
     owner = str(uuid.uuid4())
 
     def claim(connection: sqlite3.Connection):
+        legacy_confirmed = connection.execute(
+            "SELECT 1 FROM idempotency_keys WHERE correlation_id = ? AND kind = ?",
+            (correlation_id, _LEGACY_DELIVERY_KIND),
+        ).fetchone()
+        if legacy_confirmed:
+            connection.execute(
+                "INSERT INTO decision_deliveries (correlation_id, owner, confirmed) VALUES (?, ?, 1) "
+                "ON CONFLICT(correlation_id) DO UPDATE SET confirmed = 1",
+                (correlation_id, owner),
+            )
+            return (owner, 1)
         connection.execute(
             "INSERT OR IGNORE INTO decision_deliveries (correlation_id, owner, confirmed) VALUES (?, ?, 0)",
             (correlation_id, owner),
