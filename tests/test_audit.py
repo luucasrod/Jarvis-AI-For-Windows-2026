@@ -1,7 +1,7 @@
 """Tests for orchestrator.audit (issue #20)."""
 from datetime import datetime, timedelta, timezone
 
-from orchestrator.audit import query_audit, record
+from orchestrator.audit import query_audit, record, record_in_transaction
 from orchestrator.persistence import Store
 
 
@@ -116,4 +116,50 @@ def test_record_without_extra_defaults_to_empty_dict(tmp_path):
     store = Store(tmp_path / "state.db")
     record(store, action="a1", origin="o", result="r")
     assert query_audit(store)[0]["extra"] == {}
+    store.close()
+
+
+# --- record_in_transaction (added for #37's atomic merge completion) ------
+
+def test_record_in_transaction_commits_with_caller_transaction(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def apply(connection):
+        record_in_transaction(connection, action="auto_merge", origin="merge_policy", result="success",
+                              correlation_id="corr-1", extra={"pr_number": 42})
+
+    store.run_in_transaction(apply)
+
+    entries = query_audit(store)
+    assert len(entries) == 1
+    assert entries[0]["action"] == "auto_merge"
+    assert entries[0]["extra"] == {"pr_number": 42}
+    store.close()
+
+
+def test_record_in_transaction_rolls_back_with_caller_transaction(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def apply(connection):
+        record_in_transaction(connection, action="auto_merge", origin="merge_policy", result="success")
+        raise ValueError("boom")
+
+    try:
+        store.run_in_transaction(apply)
+    except ValueError:
+        pass
+
+    assert query_audit(store) == []
+    store.close()
+
+
+def test_record_in_transaction_redacts_secrets_like_record(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def apply(connection):
+        record_in_transaction(connection, action="a1", origin="o", result="r", extra={"api_token": "secret"})
+
+    store.run_in_transaction(apply)
+
+    assert query_audit(store)[0]["extra"] == {"api_token": "***"}
     store.close()
