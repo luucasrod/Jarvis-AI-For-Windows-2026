@@ -98,6 +98,8 @@ def request_review(
     passed: bool,
     store: Store,
     feedback: str = "",
+    *,
+    head_sha: str | None = None,
 ) -> ReviewResult:
     """Processes the verdict of an already-performed independent review
     (reviewer must differ from implementer - #24's classify_task only
@@ -108,6 +110,14 @@ def request_review(
     `passed` is supplied by the caller (a human, or another agent
     session's judgement) - this function's own job is purely the state
     machine around that verdict, not performing the review.
+
+    `head_sha`, when the caller can supply it (a task backed by a PR),
+    is recorded on the REVIEW_PASSED event so a consumer - #37's
+    merge_policy, specifically - can verify the review it's relying on
+    was actually performed against the EXACT commit it's about to merge,
+    not just "this task, at some point, passed review" (added per Review
+    Task #111's demand for a durable, checkable attestation rather than
+    a caller-supplied claim alone).
 
     Raises ValueError if implementer/reviewer aren't two distinct,
     concrete agents - classify_task only RECOMMENDS who should review,
@@ -131,10 +141,13 @@ def request_review(
     )
 
     if passed:
+        payload = {"task_id": task.id, "reviewer": reviewer.value}
+        if head_sha is not None:
+            payload["head_sha"] = head_sha
         emit(
             store,
             EventType.REVIEW_PASSED,
-            {"task_id": task.id, "reviewer": reviewer.value},
+            payload,
             correlation_id=task.correlation_id,
             project_id=task.project_id,
         )

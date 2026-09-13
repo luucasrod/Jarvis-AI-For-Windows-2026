@@ -2,29 +2,42 @@
 
 Merges a PR automatically only when ALL of the following hold: the task's
 last recorded review verdict (#29's REVIEW_PASSED/REVIEW_FAILED events) is
-PASS, the PR is open, not a draft, targets the expected base, its current
-head matches the exact commit the caller says was reviewed, GitHub reports
-it clean/up-to-date against that base, and its required CI checks are
-green. A failed/blocked check is a normal "don't merge yet" outcome, never
-an automatic escalation to Lucas - #29 already owns that escalation
-policy, and this module's OUT OF SCOPE explicitly excludes resolving merge
-conflicts (that stays the implementing agent's normal job).
+PASS *and was recorded against this exact commit*, the PR is open, not a
+draft, targets the expected base, its current head matches that same
+commit, GitHub reports it clean/up-to-date against that base, and its
+required CI checks are green. A failed/blocked check is a normal "don't
+merge yet" outcome, never an automatic escalation to Lucas - #29 already
+owns that escalation policy, and this module's OUT OF SCOPE explicitly
+excludes resolving merge conflicts (that stays the implementing agent's
+normal job).
 
 `expected_head_sha` and `expected_base` are supplied by the caller (the
-runtime that requested/received the review) rather than inferred here:
-#29's REVIEW_PASSED event only carries task_id+reviewer, not which exact
-commit or PR was reviewed, so this module cannot on its own tell a stale
-review apart from a fresh one. Requiring the caller to state - and this
-module to verify against the PR's live head - closes the most dangerous
-gap (a new push after review still gets merged unreviewed) without this
-issue reaching into #29's event schema. Binding the review verdict itself
-to a specific commit/PR would need to happen there, if ever required.
+runtime that requested/received the review). The review attestation
+itself is no longer caller-supplied alone: #29's request_review() now
+accepts an optional `head_sha` and records it on REVIEW_PASSED (Review
+Task #111, finding #1 - a caller-supplied expected_head_sha that merely
+gets compared to the PR's current head does not prove THAT commit was
+what got reviewed; a PASS event for one head must not authorize merging
+a different one). `_review_passed` here requires the last REVIEW_PASSED
+event's own recorded head_sha to match `expected_head_sha` - a PASS with
+no head_sha recorded (an older caller, or one that couldn't supply it)
+is treated as no attestation for THIS commit, not as a pass.
 
 Every decision (merged, skipped, or failed) is recorded via #20's audit
-log, per the issue's own risk-mitigation note (RISK: Alto). Completing a
-merge is recorded (MERGE_COMPLETED) at most once per (repo, PR, head sha)
-via #13's run_sync_once, so a retry or a concurrent caller after a
-crash/timeout never double-emits.
+log, per the issue's own risk-mitigation note (RISK: Alto). A completed
+merge's event AND audit record are written together, atomically, via
+#13's run_sync_once + #20's record_in_transaction, keyed on (repo, PR,
+head sha) - reached from BOTH "GitHub already reports this merged" and
+"we just merged it and confirmed" (Review Task #111, finding #2: the
+first version only reconciled completion on the path where THIS call
+performed the merge - a crash between a successful remote merge and
+recording it left the already-merged path forever silent on retry,
+since it returned early without ever calling this reconciliation).
+Either path also verifies the merged PR's head actually matches
+`expected_head_sha` before ever reporting success (finding #3) - a
+race where a different commit ends up merged is reported as
+`merged_different_head`, never silently claimed as this task's own
+completion.
 
 All GitHub calls go through `gh` CLI via subprocess with argument arrays,
 same pattern as #17's github_client.py - no shell involved, still fully
@@ -42,6 +55,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from orchestrator.audit import record as audit_record
+from orchestrator.audit import record_in_transaction as audit_record_in_transaction
 from orchestrator.events import EventType, emit_in_transaction, query_events
 from orchestrator.models import Task
 from orchestrator.persistence import Store
@@ -62,17 +76,21 @@ class MergeOutcome:
     already_merged: bool = False
 
 
-def _review_passed(store: Store, task: Task) -> bool:
-    """True if the LAST review verdict recorded for this task (by its
-    correlation_id) was PASS - a later REVIEW_FAILED always overrides an
-    earlier PASS, and no verdict at all is never treated as a pass."""
+def _review_passed(store: Store, task: Task, expected_head_sha: str) -> bool:
+    """True only if the LAST review verdict recorded for this task (by
+    its correlation_id) was PASS *for this exact commit* - a later
+    REVIEW_FAILED always overrides an earlier PASS, no verdict at all is
+    never treated as a pass, and a PASS recorded without a head_sha (or
+    for a different one) is not an attestation for `expected_head_sha`
+    and is likewise never treated as a pass."""
     events = query_events(
         store, correlation_id=task.correlation_id,
         event_types=[EventType.REVIEW_PASSED, EventType.REVIEW_FAILED],
     )
     if not events:
         return False
-    return events[-1]["event_type"] == EventType.REVIEW_PASSED
+    last = events[-1]
+    return last["event_type"] == EventType.REVIEW_PASSED and last["payload"].get("head_sha") == expected_head_sha
 
 
 def _pr_view(repo: str, pr_number: int, run_fn: Callable, timeout: float) -> dict:
@@ -160,14 +178,15 @@ def try_auto_merge(
     run_fn: Callable | None = None,
     timeout: float = 30,
 ) -> MergeOutcome:
-    """Merges `pr_number` into `expected_base` if review passed, the PR's
-    current head is exactly `expected_head_sha`, GitHub reports it open,
-    non-draft, clean/up-to-date against that base, and CI is green (per
-    `required_checks`, or every reported check when omitted). Idempotent:
-    calling this twice on an already-merged PR never re-attempts the merge
-    or raises, and completion is recorded at most once per (repo, PR,
-    head sha) even across retries or a crash between merging and
-    recording.
+    """Merges `pr_number` into `expected_base` if review passed FOR
+    `expected_head_sha` specifically, the PR's current head is exactly
+    that commit, GitHub reports it open, non-draft, clean/up-to-date
+    against that base, and CI is green (per `required_checks`, or every
+    reported check when omitted). Idempotent: calling this twice on an
+    already-merged PR never re-attempts the merge or raises, and
+    completion (event + audit) is recorded exactly once per (repo, PR,
+    head sha) regardless of which call - or which of the two paths that
+    can observe a completed merge - gets there first.
     """
     run = run_fn or subprocess.run
 
@@ -178,7 +197,32 @@ def try_auto_merge(
                      extra={"pr_number": pr_number, "repo": repo, "reason": reason})
         return outcome
 
-    if not _review_passed(store, task):
+    def _reconcile_merged(merge_commit_oid) -> MergeOutcome:
+        """Records MERGE_COMPLETED + the success audit entry atomically,
+        exactly once per (repo, pr_number, expected_head_sha) - called
+        from both "GitHub already reports this merged" and "we just
+        merged it and confirmed", so a crash on either path before this
+        point is safely retried into the same outcome."""
+        key = f"merge_policy:{repo}:{pr_number}:{expected_head_sha}"
+
+        def apply(connection):
+            emit_in_transaction(
+                connection, EventType.MERGE_COMPLETED,
+                {"repo": repo, "pr_number": pr_number, "task_id": task.id,
+                 "head_sha": expected_head_sha, "merge_commit": merge_commit_oid},
+                correlation_id=task.correlation_id, project_id=task.project_id,
+            )
+            audit_record_in_transaction(
+                connection, action="auto_merge", origin="merge_policy", result="success",
+                correlation_id=task.correlation_id, project_id=task.project_id,
+                extra={"pr_number": pr_number, "repo": repo, "reason": "merged"},
+            )
+
+        newly_recorded = store.run_sync_once(key, "merged", apply)
+        return MergeOutcome(merged=True, reason="merged" if newly_recorded else "already_merged",
+                             already_merged=not newly_recorded)
+
+    if not _review_passed(store, task, expected_head_sha):
         return _fail("review_not_passed")
 
     try:
@@ -187,11 +231,11 @@ def try_auto_merge(
         return _fail(error.reason, result="failed")
 
     if pr.get("state") == "MERGED":
-        outcome = MergeOutcome(merged=True, reason="already_merged", already_merged=True)
-        audit_record(store, action="auto_merge", origin="merge_policy", result="skipped",
-                     correlation_id=task.correlation_id, project_id=task.project_id,
-                     extra={"pr_number": pr_number, "repo": repo, "reason": outcome.reason})
-        return outcome
+        if pr.get("headRefOid") != expected_head_sha:
+            # Some other commit ended up merged (a race, or a stale call
+            # against a PR that moved on) - never claimed as OUR success.
+            return _fail("merged_different_head", result="failed")
+        return _reconcile_merged((pr.get("mergeCommit") or {}).get("oid"))
 
     if pr.get("state") != "OPEN":
         return _fail("pr_not_open")
@@ -224,22 +268,12 @@ def try_auto_merge(
             return _fail("merge_queued_unconfirmed")
         return _fail("merge_command_failed", result="failed")
 
-    key = f"merge_policy:{repo}:{pr_number}:{expected_head_sha}"
+    if confirmed.get("headRefOid") != expected_head_sha:
+        # Between our pre-merge check and this confirmation, a different
+        # commit got merged instead (another actor's push+merge raced
+        # ours) - --match-head-commit should have refused our OWN merge
+        # command in that case, but the confirmation is checked
+        # independently rather than trusting that alone.
+        return _fail("merged_different_head", result="failed")
 
-    def record(connection):
-        emit_in_transaction(
-            connection, EventType.MERGE_COMPLETED,
-            {"repo": repo, "pr_number": pr_number, "task_id": task.id,
-             "head_sha": expected_head_sha,
-             "merge_commit": (confirmed.get("mergeCommit") or {}).get("oid")},
-            correlation_id=task.correlation_id, project_id=task.project_id,
-        )
-
-    newly_recorded = store.run_sync_once(key, "merged", record)
-    outcome = MergeOutcome(merged=True, reason="merged")
-    audit_record(store, action="auto_merge", origin="merge_policy",
-                 result="success" if newly_recorded else "skipped",
-                 correlation_id=task.correlation_id, project_id=task.project_id,
-                 extra={"pr_number": pr_number, "repo": repo,
-                        "reason": "merged" if newly_recorded else "already_recorded"})
-    return outcome
+    return _reconcile_merged((confirmed.get("mergeCommit") or {}).get("oid"))
