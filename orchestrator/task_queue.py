@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from orchestrator.audit import record as audit_record
 from orchestrator.github_client import GitHubClient
 from orchestrator.models import Task, TaskState
 from orchestrator.persistence import Store
@@ -97,20 +98,22 @@ def _resolve_fallback_path(project_context) -> Path | None:
     return candidate
 
 
-def _analyze_batch(tasks: list[Task]) -> tuple[list[Task], set[str]]:
+def _analyze_batch(tasks: list[Task], store: Store) -> tuple[list[Task], set[str]]:
     """Topologically orders `tasks` (Kahn's algorithm, dependencies within
     this batch only) and computes which ids must be DEFERRED - never
     materialized as free-standing work in either destination - because
     they are NEEDS_LUCAS, already BLOCKED (including a cycle the planner
     already flagged, #22), part of a cycle within this batch that ISN'T
     state-flagged (defensive - a hand-built plan might not have gone
-    through the planner's own cycle detection), or depend directly or
-    transitively on another deferred task in this same batch. A
-    dependency OUTSIDE this batch (e.g. one collapsed onto an existing
-    store task by the planner's own dedup) is never grounds for deferral
-    - #23's scope only covers wiring dependencies among tasks
-    materialized together; it just can't be referenced by a real Issue
-    number created here."""
+    through the planner's own cycle detection), depend on a dependency
+    OUTSIDE this batch that isn't verifiably DONE in the Store (Review
+    Task #117 round 2, finding #1: the planner's own dedup can point a
+    dependency at a persisted task that hasn't finished yet - "not in
+    this batch" never means "already resolved", only real evidence does;
+    an external dependency that IS confirmed DONE is fine to proceed
+    past, it just can't be cited by a real Issue number here), or depend
+    directly or transitively on another deferred task in this same
+    batch."""
     by_id = {task.id: task for task in tasks}
     remaining_deps = {
         task.id: sum(1 for dep_id in task.dependencies if dep_id in by_id)
@@ -138,6 +141,18 @@ def _analyze_batch(tasks: list[Task]) -> tuple[list[Task], set[str]]:
 
     deferred = {task.id for task in tasks if task.state in (TaskState.NEEDS_LUCAS, TaskState.BLOCKED)}
     deferred.update(task.id for task in cyclic)
+
+    for task in tasks:
+        if task.id in deferred:
+            continue
+        for dep_id in task.dependencies:
+            if dep_id in by_id:
+                continue  # in-batch - handled by the transitive closure below
+            existing = store.get_task(dep_id)
+            if existing is None or existing.state != TaskState.DONE:
+                deferred.add(task.id)
+                break
+
     changed = True
     while changed:
         changed = False
@@ -151,20 +166,45 @@ def _analyze_batch(tasks: list[Task]) -> tuple[list[Task], set[str]]:
     return ordered, deferred
 
 
+_RELATIONSHIPS_SECTION = re.compile(
+    r"\n?## RELATIONSHIPS\n(?:BLOCKED_BY:.*\n?)?(?:BLOCKS:.*\n?)?", re.IGNORECASE,
+)
+
+
+def _relationships_block(blocked_by_numbers: list[int], blocks_numbers: list[int]) -> str:
+    return (
+        "## RELATIONSHIPS\n"
+        "BLOCKED_BY: " + (", ".join(f"#{n}" for n in blocked_by_numbers) if blocked_by_numbers else "none") + "\n"
+        "BLOCKS: " + (", ".join(f"#{n}" for n in blocks_numbers) if blocks_numbers else "none") + "\n"
+    )
+
+
 def _issue_body(task: Task, blocked_by_numbers: list[int], blocks_numbers: list[int]) -> str:
     lines = [task.objective or task.title, ""]
     if task.acceptance_criteria:
         lines.append("## ACCEPTANCE CRITERIA")
         lines.extend(f"- {item}" for item in task.acceptance_criteria)
         lines.append("")
-    lines.append("## RELATIONSHIPS")
-    lines.append(
-        "BLOCKED_BY: " + (", ".join(f"#{number}" for number in blocked_by_numbers) if blocked_by_numbers else "none")
-    )
-    lines.append(
-        "BLOCKS: " + (", ".join(f"#{number}" for number in blocks_numbers) if blocks_numbers else "none")
-    )
+    lines.append(_relationships_block(blocked_by_numbers, blocks_numbers).rstrip("\n"))
     return "\n".join(lines)
+
+
+def _patch_relationships(existing_body: str, blocked_by_numbers: list[int], blocks_numbers: list[int]) -> str:
+    """Replaces ONLY the RELATIONSHIPS section of an already-created
+    Issue's CURRENT body, preserving everything else - #17's own
+    jarvis-correlation marker, the objective/acceptance-criteria text,
+    and any human edits or content from a title-deduplicated pre-existing
+    Issue. Regenerating the whole body (as the first version of this
+    backfill did) silently erased the correlation marker, breaking #17's
+    own dedup on any later replay (Review Task #117 round 2, finding #3).
+    A body with no recognizable RELATIONSHIPS section (unexpected shape -
+    a human-authored issue, say) gets the section appended rather than
+    risk rewriting content whose structure isn't understood."""
+    new_section = _relationships_block(blocked_by_numbers, blocks_numbers)
+    if _RELATIONSHIPS_SECTION.search(existing_body):
+        return _RELATIONSHIPS_SECTION.sub("\n" + new_section, existing_body, count=1)
+    separator = "" if not existing_body else ("\n\n" if not existing_body.endswith("\n\n") else "")
+    return existing_body + separator + new_section
 
 
 def _materialize_to_github(
@@ -174,7 +214,7 @@ def _materialize_to_github(
         return []
     client = client or GitHubClient(store)
     by_id = {task.id: task for task in tasks}
-    ordered, deferred = _analyze_batch(tasks)
+    ordered, deferred = _analyze_batch(tasks, store)
     task_to_issue: dict[str, int] = {}
     created: list[int] = []
 
@@ -206,9 +246,11 @@ def _materialize_to_github(
 
     # Second pass: a child's Issue number cannot be known before it
     # exists, so BLOCKS can only be backfilled onto its parent's body
-    # after every creation in this batch has settled. update_issue_body
-    # always sends the full desired body, so repeating this is a no-op,
-    # not a duplicate (#23, finding #4).
+    # after every creation in this batch has settled. This patches only
+    # the RELATIONSHIPS section of the parent's CURRENT remote body (see
+    # _patch_relationships) - never a wholesale regeneration, which used
+    # to erase #17's own correlation marker and any human-added content
+    # (Review Task #117 round 2, finding #3).
     blocks_by_parent: dict[str, list[int]] = {}
     for task in tasks:
         child_number = task_to_issue.get(task.id)
@@ -219,22 +261,49 @@ def _materialize_to_github(
             if parent_number is not None:
                 blocks_by_parent.setdefault(dep_id, []).append(child_number)
 
-    for parent_id, blocks_numbers in blocks_by_parent.items():
-        parent = by_id[parent_id]
-        blocked_by_numbers = [task_to_issue[dep_id] for dep_id in parent.dependencies if dep_id in task_to_issue]
-        client.update_issue_body(
-            project_context.repository, task_to_issue[parent_id],
-            _issue_body(parent, blocked_by_numbers, sorted(blocks_numbers)),
-        )
+    if blocks_by_parent:
+        fetch = client.list_issues(project_context.repository, state="all")
+        current_by_number = {item["number"]: item for item in fetch["issues"]} if fetch.get("available") else {}
+
+        for parent_id, blocks_numbers in blocks_by_parent.items():
+            parent = by_id[parent_id]
+            parent_number = task_to_issue[parent_id]
+            current = current_by_number.get(parent_number)
+            if current is None:
+                # Can't safely patch without reading the real current body
+                # first - reported as an incomplete relationship rather
+                # than silently guessed at or overwritten blind.
+                audit_record(
+                    store, action="materialize_relationships", origin="task_queue", result="incomplete",
+                    correlation_id=parent.correlation_id, project_id=parent.project_id,
+                    extra={"issue_number": parent_number, "reason": "current_body_unavailable"},
+                )
+                continue
+            blocked_by_numbers = [task_to_issue[dep_id] for dep_id in parent.dependencies if dep_id in task_to_issue]
+            new_body = _patch_relationships(current.get("body") or "", blocked_by_numbers, sorted(blocks_numbers))
+            result = client.update_issue_body(project_context.repository, parent_number, new_body)
+            if not result.get("available"):
+                audit_record(
+                    store, action="materialize_relationships", origin="task_queue", result="incomplete",
+                    correlation_id=parent.correlation_id, project_id=parent.project_id,
+                    extra={"issue_number": parent_number, "reason": result.get("reason")},
+                )
 
     return created
+
+
+def _fallback_marker(correlation_id: str) -> str:
+    return f"<!-- jarvis-correlation:{correlation_id} -->"
 
 
 def _format_fallback_block(pending: list[Task], by_id: dict[str, Task]) -> str:
     lines = ["## Novas tarefas do planner", ""]
     for task in pending:
         dep_titles = [by_id[dep_id].title for dep_id in task.dependencies if dep_id in by_id]
-        lines.append(f"- [ ] {task.title} (depende de: {', '.join(dep_titles) if dep_titles else 'nenhuma'})")
+        lines.append(
+            f"- [ ] {task.title} (depende de: {', '.join(dep_titles) if dep_titles else 'nenhuma'}) "
+            f"{_fallback_marker(task.correlation_id)}"
+        )
         if task.objective and task.objective != task.title:
             lines.append(f"  {task.objective}")
     return "\n".join(lines) + "\n"
@@ -243,22 +312,37 @@ def _format_fallback_block(pending: list[Task], by_id: dict[str, Task]) -> str:
 def _materialize_to_fallback(tasks: list[Task], path: Path, store: Store) -> None:
     """Appends never-before-written tasks to the project's own queue file.
 
-    Durability/idempotency uses #13's generic idempotency_keys table, one
-    key per (task correlation_id, destination path): a task already
-    marked written is skipped on a replay, and content already in the
-    file is never touched or duplicated. The residual gap - a crash
-    between the file write succeeding and the key being recorded - is not
-    closed here: unlike #17/#18's network operations, a local file append
-    has no "uncertain, might have landed" state to reconcile against, so
-    the ordinary repeated-call case (the one actually reported, #23
-    Review Task #117 finding #3) is what this guards.
+    Each written line carries a `jarvis-correlation` marker (same idea as
+    #17's own Issue-body marker). Before appending, the file's CURRENT
+    content is read and any task whose marker is already present is
+    skipped - this is the authority a replay checks, not just #13's
+    idempotency_keys table (kept as a secondary, faster guard). A crash
+    between the file write succeeding and the key being recorded used to
+    duplicate the entry on the next replay (Review Task #117 round 2,
+    finding #2, reproduced by injecting a failure right at that write);
+    re-scanning the file's actual text closes that window, since the
+    marker is already there in the file the moment the append itself
+    lands, regardless of whether the DB write after it ever completes.
+    Concurrent writers appending to the same local file are still not
+    coordinated (no locking) - out of this fix's scope, disclosed rather
+    than silently assumed away.
     """
     by_id = {task.id: task for task in tasks}
-    ordered, deferred = _analyze_batch(tasks)
+    ordered, deferred = _analyze_batch(tasks, store)
     kind = f"fallback_queue:{path}"
+    candidates = [task for task in ordered if task.id not in deferred]
+    if not candidates:
+        return
+
+    try:
+        existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return
+
     pending = [
-        task for task in ordered
-        if task.id not in deferred and not store.has_idempotency_key(task.correlation_id, kind)
+        task for task in candidates
+        if _fallback_marker(task.correlation_id) not in existing_text
+        and not store.has_idempotency_key(task.correlation_id, kind)
     ]
     if not pending:
         return
