@@ -306,14 +306,21 @@ def _materialize_to_github(
                 # first - recorded as a queryable incomplete relationship
                 # (see list_incomplete_relationships) rather than silently
                 # guessed at or overwritten blind.
-                _record_incomplete_relationship(store, project_context.repository, parent, parent_number,
-                                                "current_body_unavailable")
+                _record_relationship_repair(store, project_context.repository, parent, parent_number,
+                                            sorted(blocks_numbers), "incomplete", "current_body_unavailable")
                 continue
             new_body = _patch_relationships(current.get("body") or "", sorted(blocks_numbers))
             result = client.update_issue_body(project_context.repository, parent_number, new_body)
-            if not result.get("available"):
-                _record_incomplete_relationship(store, project_context.repository, parent, parent_number,
-                                                result.get("reason"))
+            if result.get("available"):
+                # Marks THIS repair identity's latest attempt as done (Review
+                # Task #117 round 4, finding: without a completion record, a
+                # later successful retry never cleared the earlier failure -
+                # list_incomplete_relationships kept returning it forever).
+                _record_relationship_repair(store, project_context.repository, parent, parent_number,
+                                            sorted(blocks_numbers), "completed")
+            else:
+                _record_relationship_repair(store, project_context.repository, parent, parent_number,
+                                            sorted(blocks_numbers), "incomplete", result.get("reason"))
 
     return created
 
@@ -321,35 +328,54 @@ def _materialize_to_github(
 _INCOMPLETE_RELATIONSHIP_ACTION = "materialize_relationships"
 
 
-def _record_incomplete_relationship(store: Store, repo: str, parent: Task, issue_number: int, reason) -> None:
+def _record_relationship_repair(
+    store: Store, repo: str, parent: Task, issue_number: int, blocks_numbers: list[int], status: str, reason=None,
+) -> None:
+    """Logs one attempt at backfilling `parent`'s BLOCKS section, keyed for
+    replay by (repo, issue_number, correlation_id) - `parent.correlation_id`
+    is stable across plan replays (#17's create_issue already dedupes on
+    it), so every attempt for the same parent lands under the same identity
+    regardless of how many times materialize_plan runs. `blocks_numbers` is
+    the intended delta itself (not just a reason string) so a future repair
+    pass can re-apply it without needing the original PlanResult, which
+    materialize_plan never persists (Review Task #117 round 4 finding)."""
     audit_record(
-        store, action=_INCOMPLETE_RELATIONSHIP_ACTION, origin="task_queue", result="incomplete",
+        store, action=_INCOMPLETE_RELATIONSHIP_ACTION, origin="task_queue", result=status,
         correlation_id=parent.correlation_id, project_id=parent.project_id,
-        extra={"repo": repo, "issue_number": issue_number, "reason": reason},
+        extra={"repo": repo, "issue_number": issue_number, "reason": reason, "blocks_numbers": blocks_numbers},
     )
 
 
 def list_incomplete_relationships(store: Store, repo: str | None = None) -> list[dict]:
-    """Returns every BLOCKS backfill that never completed (Review Task
-    #117 round 3, finding #3: a log entry alone is evidence, not a
-    contract a caller can act on) - a durable, queryable record of
-    exactly which (repo, issue_number, correlation_id, reason) still
-    needs its relationships repaired, for a future retry pass to consume.
-    This module doesn't retry automatically - no runtime currently calls
-    materialize_plan on a recurring schedule that could safely re-run
-    just the repair - but the record is real and actionable, not merely
-    logged prose."""
+    """Returns only the BLOCKS backfills whose MOST RECENT attempt for that
+    (repo, issue_number, correlation_id) identity is still incomplete
+    (Review Task #117 round 4: a completed retry never cleared its earlier
+    failure record, so this used to return the same stale entry forever
+    even after the relationship was successfully patched). Each returned
+    item carries `blocks_numbers` - the delta a retry actually needs to
+    re-apply, not just a reason string - since no PlanResult is persisted
+    for materialize_plan to replay from."""
     entries = query_audit(store, project_id=None)
+    latest_by_identity: dict[tuple, dict] = {}
+    for entry in entries:
+        if entry["action"] != _INCOMPLETE_RELATIONSHIP_ACTION:
+            continue
+        identity = (entry["extra"].get("repo"), entry["extra"].get("issue_number"), entry["correlation_id"])
+        # query_audit is already ordered created_at ASC, id ASC - the last
+        # write per identity seen here IS the most recent attempt.
+        latest_by_identity[identity] = entry
+
     incomplete = [
         {
             "repo": entry["extra"].get("repo"),
             "issue_number": entry["extra"].get("issue_number"),
             "correlation_id": entry["correlation_id"],
             "reason": entry["extra"].get("reason"),
+            "blocks_numbers": entry["extra"].get("blocks_numbers", []),
             "created_at": entry["created_at"],
         }
-        for entry in entries
-        if entry["action"] == _INCOMPLETE_RELATIONSHIP_ACTION and entry["result"] == "incomplete"
+        for entry in latest_by_identity.values()
+        if entry["result"] == "incomplete"
     ]
     if repo is not None:
         incomplete = [item for item in incomplete if item["repo"] == repo]
