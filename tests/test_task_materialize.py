@@ -5,13 +5,19 @@ import subprocess
 
 import pytest
 
+from orchestrator.audit import query_audit
 from orchestrator.config import OrchestratorConfig
 from orchestrator.github_client import GitHubClient
 from orchestrator.models import AgentClass, ExecutionMode, Task, TaskState
 from orchestrator.persistence import Store
 from orchestrator.planner import PlanResult
 from orchestrator.project_resolver import ProjectContext
-from orchestrator.task_queue import _resolve_fallback_path, _uses_github_issues, materialize_plan
+from orchestrator.task_queue import (
+    _resolve_fallback_path,
+    _uses_github_issues,
+    list_incomplete_relationships,
+    materialize_plan,
+)
 
 
 class Clock:
@@ -31,9 +37,10 @@ class GitHub:
     fail_titles lets a test force specific creations to fail (simulating
     a transient error) without touching production code."""
 
-    def __init__(self, fail_titles=()):
+    def __init__(self, fail_titles=(), patch_error=None):
         self.issues, self.posts, self.patches = [], [], []
         self.fail_titles = set(fail_titles)
+        self.patch_error = patch_error
 
     def run(self, args, **kwargs):
         method = args[args.index('--method') + 1]
@@ -44,6 +51,8 @@ class GitHub:
             number = int(endpoint.rsplit('/', 1)[-1])
             body = json.loads(kwargs['input'])
             self.patches.append({'number': number, **body})
+            if self.patch_error:
+                return subprocess.CompletedProcess(args, 1, '', self.patch_error)
             for issue in self.issues:
                 if issue['number'] == number:
                     issue['body'] = body['body']
@@ -263,18 +272,50 @@ def test_blocked_task_and_its_dependent_are_deferred_not_published_free(setup):
     assert github.posts == []
 
 
-def test_dependency_outside_this_batch_is_not_grounds_for_deferral(setup):
-    # An id that isn't part of THIS batch (e.g. a pre-existing store task
-    # from a prior plan) simply can't be cited by number here - that's a
-    # documented limitation, not a reason to defer/block the task.
+def test_external_dependency_confirmed_done_is_not_grounds_for_deferral(setup):
+    # An id that isn't part of THIS batch but IS persisted and DONE is
+    # genuinely resolved - it just can't be cited by a real Issue number
+    # here (documented limitation), which is not a reason to defer.
     store, github, client = setup
-    task = _task(title="Depends on something external", dependencies=["not-in-this-batch"])
+    external = _task(title="External done work", state=TaskState.DONE)
+    store.save_task(external)
+    task = _task(title="Depends on external done work", dependencies=[external.id])
     plan_result = PlanResult(tasks=[task])
 
     numbers = materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
 
     assert numbers == [1]
     assert "BLOCKED_BY: none" in github.posts[0]['body']
+
+
+def test_external_dependency_still_in_progress_defers_the_task(setup):
+    # Regression (Review Task #117 round 2, finding #1): the planner's
+    # own dedup can point a dependency at a persisted task that hasn't
+    # finished - "not in this batch" must never be read as "resolved"
+    # without real evidence.
+    store, github, client = setup
+    external = _task(title="External still in progress", state=TaskState.IN_PROGRESS)
+    store.save_task(external)
+    task = _task(title="Depends on unresolved external work", dependencies=[external.id])
+    plan_result = PlanResult(tasks=[task])
+
+    numbers = materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    assert numbers == []
+    assert github.posts == []
+
+
+def test_external_dependency_that_does_not_exist_anywhere_defers_the_task(setup):
+    # A missing task is exactly as unresolved as one that's merely still
+    # in progress - never treated as silently satisfied.
+    store, github, client = setup
+    task = _task(title="Depends on nothing that exists", dependencies=["ghost-task-id"])
+    plan_result = PlanResult(tasks=[task])
+
+    numbers = materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    assert numbers == []
+    assert github.posts == []
 
 
 def test_fallback_path_cannot_escape_project_root_via_relative_traversal(tmp_path):
@@ -335,6 +376,86 @@ def test_fallback_write_is_idempotent_across_replays(tmp_path):
     store.close()
 
 
+def test_blocks_backfill_preserves_correlation_marker_and_other_content(setup):
+    # Regression (Review Task #117 round 2, finding #3): the first version
+    # of the BLOCKS backfill regenerated the WHOLE body, silently erasing
+    # #17's own jarvis-correlation marker (breaking its dedup on any later
+    # replay) and any human-added content. The real GitHubClient embeds
+    # the marker itself at POST time, so this exercises the real path.
+    store, github, client = setup
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    base_issue = next(issue for issue in github.issues if issue['title'] == "Base work")
+    assert "jarvis-correlation:" in base_issue['body']
+    assert "BLOCKS: #2" in base_issue['body']
+    assert "Do the thing" in base_issue['body']  # original objective text preserved
+
+    # A replay must still be recognized as the same Issue (dedup depends
+    # on the marker surviving the patch).
+    second = materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+    assert second == [1, 2]
+    assert len(github.posts) == 2  # no re-POST
+
+
+def test_patch_failure_is_recorded_as_incomplete_not_silently_dropped(tmp_path):
+    store = Store(tmp_path / 'state.db')
+    github = GitHub(patch_error="server error")
+    client = GitHubClient(store, config=OrchestratorConfig(retry_interval_seconds=10),
+                          run_fn=github.run, clock=Clock(), timeout_seconds=5)
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    numbers = materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    assert numbers == [1, 2]  # both still created - only the relationship backfill failed
+    entries = query_audit(store)
+    incomplete = [e for e in entries if e['action'] == 'materialize_relationships' and e['result'] == 'incomplete']
+    assert len(incomplete) == 1
+    assert incomplete[0]['extra']['issue_number'] == 1
+    store.close()
+
+
+def test_fallback_write_survives_crash_between_append_and_idempotency_record(tmp_path):
+    # Regression (Review Task #117 round 2, finding #2): a crash right
+    # after the file append but before record_idempotency_key used to
+    # duplicate the entry on the next replay. Simulated here by writing
+    # the block directly (bypassing the DB write) and then replaying
+    # through materialize_plan - the in-file marker must be what a replay
+    # actually trusts, not just the DB key.
+    store = Store(tmp_path / 'state.db')
+    (tmp_path / "docs" / "ai").mkdir(parents=True)
+    fila = tmp_path / "docs" / "ai" / "FILA.md"
+    fila.write_text("# Fila existente\n", encoding="utf-8")
+    project = ProjectContext(canonical_id="pdr", root=str(tmp_path), task_source=FILA_PROJECT.task_source)
+    task = _task(title="Crash recovery task")
+    plan_result = PlanResult(tasks=[task])
+
+    # First call succeeds normally (both file write and DB record happen).
+    materialize_plan(plan_result, project, store, client=None)
+    assert fila.read_text(encoding="utf-8").count("Crash recovery task") == 1
+
+    from orchestrator.task_queue import _fallback_marker
+    assert _fallback_marker(task.correlation_id) in fila.read_text(encoding="utf-8")
+
+    # Simulate the crash directly: the DB write that should have followed
+    # the (already-landed) file append never happened. A replay must
+    # still recognize the task via the in-file marker alone, not the
+    # (now-missing) idempotency key.
+    store.execute(
+        "DELETE FROM idempotency_keys WHERE correlation_id = ? AND kind = ?",
+        (task.correlation_id, f"fallback_queue:{fila.resolve()}"),
+    )
+
+    materialize_plan(plan_result, project, store, client=None)
+    assert fila.read_text(encoding="utf-8").count("Crash recovery task") == 1
+    store.close()
+
+
 def test_fallback_defers_dependent_of_needs_lucas_task(tmp_path):
     store = Store(tmp_path / 'state.db')
     (tmp_path / "docs" / "ai").mkdir(parents=True)
@@ -350,4 +471,100 @@ def test_fallback_defers_dependent_of_needs_lucas_task(tmp_path):
     content = fila.read_text(encoding="utf-8")
     assert "Needs a human" not in content
     assert "Waits on human decision" not in content
+    store.close()
+
+
+# --- Regressions from Codex's round-3 review (Review Task #117) -----------
+
+def test_concurrent_fallback_writers_never_duplicate_the_same_task(tmp_path):
+    # Regression (finding #1): two connections both reading "not written
+    # yet" before either commits its append used to duplicate the entry.
+    # The whole read-check-append-record sequence now runs inside one
+    # SQLite transaction (BEGIN IMMEDIATE), which genuinely serializes
+    # concurrent connections sharing the same db file.
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    db_path = tmp_path / 'state.db'
+    (tmp_path / "docs" / "ai").mkdir(parents=True)
+    fila = tmp_path / "docs" / "ai" / "FILA.md"
+    fila.write_text("# Fila existente\n", encoding="utf-8")
+    project = ProjectContext(canonical_id="pdr", root=str(tmp_path), task_source=FILA_PROJECT.task_source)
+    task = _task(title="Concurrent fallback task")
+    plan_result = PlanResult(tasks=[task])
+
+    setup_store = Store(db_path)
+    setup_store.close()
+    stores = [Store(db_path) for _ in range(4)]
+    barrier = Barrier(4)
+
+    def write(store):
+        barrier.wait(timeout=5)
+        materialize_plan(plan_result, project, store, client=None)
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(write, stores))
+    finally:
+        for store in stores:
+            store.close()
+
+    content = fila.read_text(encoding="utf-8")
+    assert content.count("Concurrent fallback task") == 1
+
+
+def test_blocks_backfill_preserves_pre_existing_unrelated_relationships(setup):
+    # Regression (finding #2): the round-2 fix preserved everything
+    # OUTSIDE the RELATIONSHIPS section, but still overwrote BOTH
+    # relationship lines from this batch's own bookkeeping alone -
+    # destroying a BLOCKED_BY/BLOCKS reference this batch has no
+    # knowledge of (a parent title-deduplicated by #17 onto a pre-
+    # existing Issue, or one a human edited after creation).
+    store, github, client = setup
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    # Simulate #17 deduplicating "Base work" (by title) onto a pre-
+    # existing Issue #50 that already has unrelated relationships this
+    # batch knows nothing about. A distinct, high number avoids
+    # colliding with the fake's own auto-numbering for freshly-posted
+    # issues (len(posts)+1).
+    github.issues.append({
+        'number': 50, 'title': 'Base work',
+        'body': 'Pre-existing issue.\n\n## RELATIONSHIPS\nBLOCKED_BY: #99\nBLOCKS: #98\n',
+        'state': 'open',
+    })
+
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    base_issue = next(issue for issue in github.issues if issue['number'] == 50)
+    assert "BLOCKED_BY: #99" in base_issue['body']  # preserved, not erased
+    assert "#98" in base_issue['body']  # preserved
+    blocks_line = next(line for line in base_issue['body'].splitlines() if line.startswith("BLOCKS:"))
+    assert "#98" in blocks_line and "#1" in blocks_line  # unioned, not replaced
+
+
+def test_incomplete_relationship_backfill_is_queryable_for_retry(tmp_path):
+    # Regression (finding #3): a log entry alone isn't a contract a
+    # caller can act on - list_incomplete_relationships() gives a
+    # durable, queryable record of exactly what still needs repair.
+    store = Store(tmp_path / 'state.db')
+    github = GitHub(patch_error="server error")
+    client = GitHubClient(store, config=OrchestratorConfig(retry_interval_seconds=10),
+                          run_fn=github.run, clock=Clock(), timeout_seconds=5)
+    base = _task(title="Base work")
+    dependent = _task(title="Dependent work", dependencies=[base.id])
+    plan_result = PlanResult(tasks=[dependent, base])
+
+    materialize_plan(plan_result, GITHUB_PROJECT, store, client=client)
+
+    incomplete = list_incomplete_relationships(store)
+    assert len(incomplete) == 1
+    assert incomplete[0]['repo'] == 'owner/repo'
+    assert incomplete[0]['issue_number'] == 1
+    assert incomplete[0]['correlation_id'] == base.correlation_id
+
+    assert list_incomplete_relationships(store, repo='owner/repo') == incomplete
+    assert list_incomplete_relationships(store, repo='someone/else') == []
     store.close()

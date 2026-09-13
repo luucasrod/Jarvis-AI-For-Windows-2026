@@ -115,7 +115,10 @@ def test_real_idleness_detected_and_escalated(tmp_path):
 
 def test_repeated_poll_of_same_stall_escalates_only_once(tmp_path):
     # Regression (finding #3): a periodic poller must not re-ask the same
-    # question on every tick while nothing about the stall changed.
+    # question on every tick while nothing about the stall changed. The
+    # returned `escalated` reflects whether THIS call is the one that
+    # actually emitted the event, not just that the cause is unexplained
+    # (round 2, finding #1's audit-mismatch note).
     store = Store(tmp_path / "state.db")
     clock = Clock("2026-09-12T10:00:00+00:00")
     task = _task(updated_at=clock())
@@ -130,8 +133,91 @@ def test_repeated_poll_of_same_stall_escalates_only_once(tmp_path):
 
     assert first is not None and second is not None
     assert first.cause == second.cause == "unexplained"
+    assert first.escalated is True
+    assert second.escalated is False
     events = query_events(store, event_types=[EventType.DECISION_REQUIRED])
     assert len(events) == 1
+    store.close()
+
+
+def test_same_task_set_stalling_again_after_real_activity_escalates_again(tmp_path):
+    # Regression (Review Task #113, round 2, finding #1): identifying an
+    # episode by task ids alone meant a SECOND stall of the exact same
+    # tasks - separated by real recovered activity in between - never
+    # escalated again. Repro shape from the review: alert at 10:16,
+    # activity at 10:17, no alert at 10:18, stalls again -> alert at 10:33.
+    store = Store(tmp_path / "state.db")
+    clock = Clock("2026-09-12T10:00:00+00:00")
+    task = _task(updated_at=clock())
+    store.save_task(task)
+
+    clock.set("2026-09-12T10:16:00+00:00")
+    first = check_idle(store, config=CONFIG, clock=clock, paperclip_available=lambda: True,
+                       paperclip_snapshot=lambda: NO_PAUSED_AGENTS)
+    assert first is not None and first.escalated is True
+
+    # Real activity resets the grace period - the SAME task is still
+    # sitting READY, but something genuinely happened.
+    emit(store, EventType.TASK_COMPLETED, {}, created_at=datetime.fromisoformat("2026-09-12T10:17:00+00:00"))
+
+    clock.set("2026-09-12T10:18:00+00:00")
+    within_new_grace = check_idle(store, config=CONFIG, clock=clock, paperclip_available=lambda: True,
+                                  paperclip_snapshot=lambda: NO_PAUSED_AGENTS)
+    assert within_new_grace is None
+
+    clock.set("2026-09-12T10:33:00+00:00")
+    second = check_idle(store, config=CONFIG, clock=clock, paperclip_available=lambda: True,
+                        paperclip_snapshot=lambda: NO_PAUSED_AGENTS)
+    assert second is not None and second.escalated is True
+
+    events = query_events(store, event_types=[EventType.DECISION_REQUIRED])
+    assert len(events) == 2
+    store.close()
+
+
+def test_new_ready_task_does_not_mask_an_old_stalled_ready_task(tmp_path):
+    # Regression (Review Task #113, round 3): gating on the MOST RECENT
+    # updated_at among free/ready tasks meant a steady trickle of new
+    # arrivals could mask an old, genuinely stalled task forever. Repro
+    # from the review: Old READY at 10:00, New READY at 10:16, no
+    # activity/IN_PROGRESS, check at 10:16 must still catch the old one.
+    store = Store(tmp_path / "state.db")
+    clock = Clock("2026-09-12T10:00:00+00:00")
+    old = _task(updated_at=clock(), title="Old stalled work")
+    store.save_task(old)
+
+    clock.set("2026-09-12T10:16:00+00:00")
+    fresh = _task(updated_at=clock(), title="Brand new work")
+    store.save_task(fresh)
+
+    diagnosis = check_idle(store, config=CONFIG, clock=clock, paperclip_available=lambda: True,
+                           paperclip_snapshot=lambda: NO_PAUSED_AGENTS)
+
+    assert diagnosis is not None
+    assert diagnosis.cause == "unexplained"
+    assert diagnosis.ready_task_ids == (old.id,)
+    store.close()
+
+
+def test_unrelated_blocked_task_activity_does_not_mask_a_stale_free_task(tmp_path):
+    # Regression (Review Task #113, round 2, finding #2): the anchor used
+    # to include EVERY task's updated_at - touching an unrelated BLOCKED
+    # task moments ago made a genuinely stale free READY task invisible.
+    store = Store(tmp_path / "state.db")
+    clock = Clock("2026-09-12T10:00:00+00:00")
+    free = _task(updated_at=clock(), title="Stale free work")
+    store.save_task(free)
+
+    clock.set("2026-09-12T10:16:00+00:00")
+    unrelated_blocked = _task(updated_at=clock(), title="Unrelated", state=TaskState.BLOCKED)
+    store.save_task(unrelated_blocked)
+
+    diagnosis = check_idle(store, config=CONFIG, clock=clock, paperclip_available=lambda: True,
+                           paperclip_snapshot=lambda: NO_PAUSED_AGENTS)
+
+    assert diagnosis is not None
+    assert diagnosis.cause == "unexplained"
+    assert diagnosis.ready_task_ids == (free.id,)
     store.close()
 
 
