@@ -48,6 +48,7 @@ except ImportError:
     _wiz_devices_config: dict = {}
 
 import paperclip_client
+import orchestrator.voice_facade as voice_facade
 
 # ─── GERENCIAMENTO DE PROCESSO ────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1613,6 +1614,23 @@ def _looks_like_paperclip_query(q: str) -> bool:
     return any(p in q for p in _PAPERCLIP_TRIGGER_PHRASES)
 
 
+# New voice_facade intents (#11) - deliberately distinct phrases from
+# _PAPERCLIP_TRIGGER_PHRASES above so the two never shadow each other.
+_ORCHESTRATOR_STATUS_PHRASES = (
+    "status da orquestração", "status da orquestracao",
+    "status do orchestrator", "como está a orquestração", "como esta a orquestracao",
+)
+_ORCHESTRATOR_REPORT_PHRASES = (
+    "relatório da orquestração", "relatorio da orquestracao",
+    "relatório do orchestrator", "relatorio do orchestrator",
+)
+_ORCHESTRATOR_CONTROL_PHRASES = (
+    "pausar orquestração", "pausar orquestracao",
+    "retomar orquestração", "retomar orquestracao",
+    "controle da orquestração", "controle da orquestracao",
+)
+
+
 def process_command(query: str) -> bool:
     q = query.lower().strip()
 
@@ -1621,6 +1639,39 @@ def process_command(query: str) -> bool:
     if _looks_like_paperclip_query(q):
         paperclip_report(query)
         return True
+
+    # ── Orquestrador (status/relatório/controle) — facade em construção
+    # (#11): qualquer exceção do orchestrator nunca derruba o Jarvis, mesmo
+    # padrão já usado com paperclip_client.py ──────────────────────────────
+    if any(p in q for p in _ORCHESTRATOR_STATUS_PHRASES):
+        try:
+            reply = voice_facade.handle_status_query(query)
+        except Exception as e:
+            _log(f"[ORCHESTRATOR] Erro no facade (status): {e}")
+            reply = None
+        if reply:
+            say(reply)
+            return True
+
+    if any(p in q for p in _ORCHESTRATOR_REPORT_PHRASES):
+        try:
+            reply = voice_facade.handle_report_query()
+        except Exception as e:
+            _log(f"[ORCHESTRATOR] Erro no facade (relatório): {e}")
+            reply = None
+        if reply:
+            say(reply)
+            return True
+
+    if any(p in q for p in _ORCHESTRATOR_CONTROL_PHRASES):
+        try:
+            reply = voice_facade.handle_control_query(query)
+        except Exception as e:
+            _log(f"[ORCHESTRATOR] Erro no facade (controle): {e}")
+            reply = None
+        if reply:
+            say(reply)
+            return True
 
     # ── Reiniciar Argos ──────────────────────────────────────────────────────
     if any(p in q for p in ["reiniciar jarvis", "jarvis reiniciar", "restart jarvis",
