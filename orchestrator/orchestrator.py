@@ -144,14 +144,33 @@ def _load_dispatch_intent(
 
 
 def _reserve_dispatch_intent(
-    store: Store, server: str, company_id: str, task_id: str, project_context, implementer: AgentName,
-    agent_id: str, title: str, description: str, now: datetime,
+    store: Store, server: str, company_id: str, task_id: str, project_context,
+    candidate: tuple[AgentName, str, str, str] | None, now: datetime,
 ) -> tuple[str, str, str] | None:
     """Commits ONE stable dispatch identity (server + agent + exact title/
     description) for this task, the first and only time it is ever
     decided, transactionally re-validating the task is STILL genuinely
-    eligible right before that commit - closing findings from rounds 3
-    and 4:
+    eligible right before that commit - closing findings from rounds 3,
+    4 and 5:
+
+    Round 5 finding #1 (existing-intent path skipped revalidation
+    entirely): the caller previously called this function ONLY when a
+    cheap outside `_load_dispatch_intent` peek found no intent yet,
+    reusing the peeked row VERBATIM otherwise - so a task whose intent
+    already existed (e.g. redirected to a new preferred agent by #26's
+    cooldown handling, or moved into review by a concurrent writer while
+    this pass was resolving a DIFFERENT task's agent) never went through
+    the reviewer-collision fixup or the STILL READY/project/dependency
+    recheck below, both of which this function has always applied to a
+    freshly-decided intent. Every dispatch attempt - not just the first -
+    now runs through this same transaction; `candidate` carries the
+    (implementer, agent_id, title, description) an outside caller
+    resolved for a possibly-new decision, or is `None` when the caller
+    only peeked an existing intent and deliberately skipped resolving a
+    new agent (no renewed availability requirement for reused work, round
+    3 finding #1, still honored). An existing intent found inside this
+    transaction is authoritative over `candidate` either way - `candidate`
+    is only ever used to WRITE a genuinely new row.
 
     Round 3 finding #1 (association incomplete for recovery): the
     previous design only remembered an agent id AFTER #18's own create
@@ -222,6 +241,15 @@ def _reserve_dispatch_intent(
                 current.updated_at = now
                 connection.execute("UPDATE tasks SET data = ? WHERE id = ?", (json.dumps(current.to_dict()), task_id))
             return existing[0], existing[1], existing[2]
+
+        if candidate is None:
+            # The outside peek found an intent and skipped resolving a new
+            # agent accordingly; no intent actually exists in THIS
+            # transaction (impossible today - dispatch intents are never
+            # deleted - but nothing here can safely invent an agent), so
+            # refuse rather than dispatch without a decided identity.
+            return None
+        implementer, agent_id, title, description = candidate
 
         if current.reviewer_preference == implementer:
             current.reviewer_preference = AgentName.CODEX if implementer == AgentName.CLAUDE else AgentName.CLAUDE
@@ -299,26 +327,32 @@ def run_daily_cycle(
     the session's own server, never a same-named agent from a different
     company. That decision (agent id + the EXACT title/description used)
     is committed exactly once as a durable `orchestrator_dispatch_intent`
-    row (`_reserve_dispatch_intent`) and reused VERBATIM on every later
-    call for the same correlation_id (`_load_dispatch_intent`) - never
-    re-decided. This closes two things at once: #18's own create is
-    idempotent by a fingerprint that includes title/description/assignee,
-    so re-deciding on a retry (a different agent because the original
-    went into cooldown, or a locally-edited title) built a DIFFERENT
-    fingerprint and hit `correlation_conflict` instead of reconciling; and
-    a POST whose response was lost (timeout) left nothing to reconcile
-    from until the SAME fingerprint was retried, which a fresh decision
-    would never reproduce. Reassignment to a different agent stays a
-    distinct, unimplemented operation. `_reserve_dispatch_intent` commits
-    only after re-validating - inside the SAME transaction - that the
-    task is STILL READY, still in this project, with every dependency
-    STILL DONE, and only then fixes up a `task.reviewer_preference`
-    collision (#24/#29's cross-review requirement): a stale outer
-    `dispatchable` snapshot can otherwise go stale during a slow external
-    call elsewhere in this same pass, letting a concurrent writer move
-    the task on (e.g. into an active review) before this commits - the
-    fresh re-check refuses dispatch (and any mutation) for a task that
-    is no longer genuinely eligible, rather than acting on the stale
+    row and reused VERBATIM as the AGENT/title/description on every later
+    call for the same correlation_id - never re-decided. This closes two
+    things at once: #18's own create is idempotent by a fingerprint that
+    includes title/description/assignee, so re-deciding on a retry (a
+    different agent because the original went into cooldown, or a
+    locally-edited title) built a DIFFERENT fingerprint and hit
+    `correlation_conflict` instead of reconciling; and a POST whose
+    response was lost (timeout) left nothing to reconcile from until the
+    SAME fingerprint was retried, which a fresh decision would never
+    reproduce. Reassignment to a different agent stays a distinct,
+    unimplemented operation. `_reserve_dispatch_intent` is called for
+    EVERY dispatch attempt, peeked-existing-intent or not (round 5 finding
+    #1 - a peeked intent reused directly, bypassing this call, skipped
+    everything below for exactly the tasks most likely to have changed
+    underneath it), and commits only after re-validating - inside the
+    SAME transaction - that the task is STILL READY, still in this
+    project, with every dependency STILL DONE, and only then fixes up a
+    `task.reviewer_preference` collision (#24/#29's cross-review
+    requirement) against the intent's own persisted implementer: a stale
+    outer `dispatchable` snapshot can otherwise go stale during a slow
+    external call elsewhere in this same pass, letting a concurrent writer
+    move the task on (e.g. into an active review, or redirect it to a
+    different preferred agent via #26's cooldown handling) before this
+    commits - the fresh re-check refuses dispatch (and any mutation) for a
+    task that is no longer genuinely eligible, rather than acting on the
+    stale
     snapshot. The assignment is INDEPENDENTLY confirmed afterward via
     `get_task_status`, comparing against the SPECIFIC id just used (not
     any non-empty value) - a task with no resolvable identity, no longer
@@ -370,12 +404,18 @@ def run_daily_cycle(
     if paperclip_session is not None and company_id is not None:
         server = _dispatch_server(paperclip_session)
         for task in dispatchable:
-            # An EXISTING intent is authoritative and reused VERBATIM,
-            # with no renewed availability requirement - the decision was
-            # already made once; only a genuinely NEW dispatch needs a
-            # free agent (Review Task #131 round 3, finding #1).
-            intent = _load_dispatch_intent(store, server, company_id, task.correlation_id)
-            if intent is None:
+            # A cheap outside peek decides whether a NEW agent needs
+            # resolving at all - an EXISTING intent needs no renewed
+            # availability requirement, the decision was already made once
+            # (Review Task #131 round 3, finding #1). But every attempt,
+            # peeked-existing or not, is REVALIDATED inside
+            # `_reserve_dispatch_intent`'s own transaction - reusing a
+            # peeked intent verbatim without going through it skipped the
+            # reviewer-collision fixup and the STILL READY/project/
+            # dependency recheck for exactly the tasks most likely to have
+            # changed underneath it (round 5 finding #1).
+            candidate = None
+            if _load_dispatch_intent(store, server, company_id, task.correlation_id) is None:
                 resolved_agent = _concrete_available_agent(store, task, clock)
                 if resolved_agent is None:
                     dispatch_incomplete.append(task.id)  # every concrete candidate is in cooldown - #26
@@ -384,13 +424,14 @@ def run_daily_cycle(
                 if agent_id is None:
                     dispatch_incomplete.append(task.id)  # no valid, same-company identity resolvable
                     continue
-                intent = _reserve_dispatch_intent(
-                    store, server, company_id, task.id, project_context, resolved_agent,
-                    agent_id, task.title, task.objective, now,
-                )
-                if intent is None:
-                    dispatch_incomplete.append(task.id)  # no longer eligible - concurrent change
-                    continue
+                candidate = (resolved_agent, agent_id, task.title, task.objective)
+
+            intent = _reserve_dispatch_intent(
+                store, server, company_id, task.id, project_context, candidate, now,
+            )
+            if intent is None:
+                dispatch_incomplete.append(task.id)  # no longer eligible - concurrent change
+                continue
 
             agent_id, title, description = intent
             result = paperclip_session.create_task_idempotent(

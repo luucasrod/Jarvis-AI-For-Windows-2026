@@ -599,8 +599,8 @@ def test_reserve_dispatch_intent_losing_call_defers_reviewer_fixup_to_the_winner
     def reserve(key, implementer, agent_id):
         start.wait(timeout=5)
         results[key] = _reserve_dispatch_intent(
-            store, "http://paperclip.invalid", "acme", task.id, PROJECT, implementer,
-            agent_id, task.title, task.objective, now,
+            store, "http://paperclip.invalid", "acme", task.id, PROJECT,
+            (implementer, agent_id, task.title, task.objective), now,
         )
 
     t1 = threading.Thread(target=reserve, args=("claude", AgentName.CLAUDE, "agent-claude"))
@@ -617,6 +617,80 @@ def test_reserve_dispatch_intent_losing_call_defers_reviewer_fixup_to_the_winner
 
     final_reviewer = store.get_task(task.id).reviewer_preference
     assert final_reviewer != winning_implementer  # never self-review
+
+
+def test_daily_cycle_revalidates_reviewer_on_a_replay_that_reused_an_existing_intent(store):
+    # Review Task #131 round 5, finding #1: a task redirected to a NEW
+    # preferred agent by #26's cooldown handling AFTER its dispatch intent
+    # already exists must still get the reviewer-collision fixup on the
+    # next cycle - the peeked-existing-intent path had been skipping
+    # `_reserve_dispatch_intent` entirely, so this recheck never ran.
+    task = _task(title="Redirected FLEX task", state=TaskState.READY,
+                agent_class=AgentClass.FLEX, preferred_agent=AgentName.CLAUDE,
+                fallback_agent=AgentName.CODEX, reviewer_preference=AgentName.CODEX)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                            company_id="acme", clock=clock)
+    assert task.id in first.assigned_task_ids
+    assert paperclip.created[-1][3] == "agent-claude"
+
+    mark_rate_limited(store, AgentName.CLAUDE, "quota")  # redirects preference to Codex
+
+    second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert task.id in second.assigned_task_ids
+    # The existing intent (agent-claude) is still reused VERBATIM - #18's
+    # fingerprint would reject a different assignee as a conflict.
+    assert paperclip.created[-1][3] == "agent-claude"
+    # But the reviewer, now colliding with the persisted implementer
+    # (Claude), must have been fixed up - never left as Claude reviewing Claude.
+    assert store.get_task(task.id).reviewer_preference != AgentName.CLAUDE
+
+
+def test_daily_cycle_never_dispatches_an_existing_intent_task_that_moved_out_of_ready_on_replay(store, monkeypatch):
+    # Review Task #131 round 5, finding #1 (second repro): a task whose
+    # dispatch intent already exists but that a concurrent writer moves
+    # out of READY (here, as a side effect of THIS SAME pass's own
+    # materialize_plan call, which runs before the dispatch loop) must be
+    # refused, not just on a task's very first dispatch attempt - the
+    # peeked-existing-intent path used to skip this recheck entirely.
+    task = _task(title="Existing intent, moved on", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, agent_class=AgentClass.CLAUDE)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession(available=False)  # first attempt never confirms remotely
+
+    first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                            company_id="acme", clock=clock)
+    assert task.id in first.dispatch_incomplete_task_ids  # intent committed, remote create failed
+    assert len(paperclip.created) == 1
+
+    paperclip.available = True  # remote reachable again on replay
+
+    def materialize_and_snatch(plan_result, *args, **kwargs):
+        current = store.get_task(task.id)
+        current.state = TaskState.IN_REVIEW  # a concurrent writer moved it on
+        store.save_task(current)
+        return []
+
+    monkeypatch.setattr("orchestrator.orchestrator.materialize_plan", materialize_and_snatch)
+
+    second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert task.id not in second.assigned_task_ids
+    assert len(paperclip.created) == 1  # never a second POST against stale-but-existing-intent work
+    assert store.get_task(task.id).state == TaskState.IN_REVIEW  # untouched
 
 
 def test_daily_cycle_reconsiders_next_cycle_task_once_its_dependency_finishes_same_day(store):
