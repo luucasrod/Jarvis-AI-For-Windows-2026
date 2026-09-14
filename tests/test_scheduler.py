@@ -259,3 +259,54 @@ def test_dependency_completion_allows_readmission_without_clearing_blockers(stor
     store.save_task(dependency)
     assert scheduler.admit_task(waiting).state == TaskState.READY
     assert len(query_events(store, event_types=[EventType.TASK_READY])) == 1
+
+
+def test_reconsider_promotes_next_cycle_once_its_dependency_finishes_same_day(store):
+    # #30, Review Task #131 round 2: on_cycle_start's own scan only fires
+    # once per day, so a NEXT_CYCLE child whose dependency finishes AFTER
+    # that scan needs a way to be revisited mid-window - never a direct
+    # state write.
+    clock = Clock('2026-09-12T08:00:00')
+    scheduler = Scheduler(store, clock)
+    dependency = task(TaskState.IN_PROGRESS)
+    store.save_task(dependency)
+    child = task(TaskState.NEXT_CYCLE, dependencies=[dependency.id])
+    store.save_task(child)
+
+    assert scheduler.reconsider(child).state == TaskState.NEXT_CYCLE  # still IN_PROGRESS
+
+    dependency.state = TaskState.DONE
+    store.save_task(dependency)
+    clock.set('2026-09-12T09:00:00')
+
+    result = scheduler.reconsider(child)
+
+    assert result.state == TaskState.READY
+    assert len(query_events(store, event_types=[EventType.TASK_READY])) == 1
+
+
+def test_reconsider_never_promotes_outside_the_window(store):
+    scheduler = Scheduler(store, Clock('2026-09-12T16:00:00'))  # after cutoff
+    child = task(TaskState.NEXT_CYCLE)
+    store.save_task(child)
+
+    result = scheduler.reconsider(child)
+
+    assert result.state == TaskState.NEXT_CYCLE
+    assert query_events(store, event_types=[EventType.TASK_READY]) == []
+
+
+def test_reconsider_never_touches_a_task_that_is_no_longer_next_cycle(store):
+    # A stale caller-held snapshot must never clobber concurrent state -
+    # the current row (READY here, from some other path) is re-read fresh.
+    scheduler = Scheduler(store, Clock('2026-09-12T09:00:00'))
+    stale = task(TaskState.NEXT_CYCLE)
+    store.save_task(stale)
+    current = Task.from_dict(stale.to_dict())
+    current.state = TaskState.READY
+    store.save_task(current)
+
+    result = scheduler.reconsider(stale)
+
+    assert result.state == TaskState.READY
+    assert query_events(store, event_types=[EventType.TASK_READY]) == []

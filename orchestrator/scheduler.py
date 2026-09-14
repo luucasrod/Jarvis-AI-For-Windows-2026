@@ -166,3 +166,37 @@ class Scheduler:
             return stored
 
         return self.store.run_in_transaction(admit)
+
+    def reconsider(self, task: Task, instant: datetime | None = None) -> Task:
+        """Re-evaluates a single NEXT_CYCLE task mid-window, transactionally.
+
+        `on_cycle_start` promotes every eligible NEXT_CYCLE task once per
+        local day; a task whose dependency finishes LATER that same day
+        (e.g. IN_PROGRESS at the 08:00 scan, DONE by 09:00) is never
+        revisited by that one-shot guard and would otherwise wait until
+        tomorrow (#30, Review Task #131 round 2). This exposes the exact
+        same window/guard/dependency check for a caller (#30) to apply to
+        one task at a time, without ever writing state directly: the
+        current row is re-read fresh inside this transaction, and only a
+        task that is (still) NEXT_CYCLE here is ever touched - a
+        concurrent write that already moved it elsewhere is never
+        overwritten.
+        """
+        now = self._now(instant)
+
+        def apply(connection: sqlite3.Connection) -> Task:
+            row = connection.execute("SELECT data FROM tasks WHERE id = ?", (task.id,)).fetchone()
+            stored = Task.from_dict(json.loads(row[0])) if row else task
+            if stored.state != TaskState.NEXT_CYCLE:
+                return stored
+            if self._open(now, connection) and _dependencies_done(connection, stored):
+                stored.state = TaskState.READY
+                stored.updated_at = now.astimezone(timezone.utc)
+                _save_task(connection, stored)
+                emit_in_transaction(
+                    connection, EventType.TASK_READY, {"task_id": stored.id},
+                    stored.correlation_id, stored.project_id, created_at=now,
+                )
+            return stored
+
+        return self.store.run_in_transaction(apply)
