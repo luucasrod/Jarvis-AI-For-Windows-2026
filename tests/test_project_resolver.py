@@ -212,6 +212,35 @@ def test_conditional_context_as_int_is_structured_error(tmp_path):
     assert isinstance(result, ResolveError)
 
 
+def test_deploy_as_scalar_is_structured_error(tmp_path):
+    index_path = tmp_path / "project_context_index.json"
+    index_path.write_text(json.dumps(_index_with_bad_project_field("deploy", "vercel")), encoding="utf-8")
+    result = ProjectResolver(str(index_path)).resolve("cashy")
+    assert isinstance(result, ResolveError)
+
+
+def test_structured_deploy_object_is_read_through(tmp_path):
+    data = json.loads(json.dumps(_SAMPLE_INDEX))
+    data["projects"]["argos_hub"]["deploy"] = {
+        "provider": "Vercel", "production_url": "https://argos-hub.vercel.app",
+        "trigger": "automatic on git push to master",
+    }
+    index_path = _write_index(tmp_path, data)
+    result = ProjectResolver(str(index_path)).resolve("hub")
+    assert isinstance(result, ProjectContext)
+    assert result.deploy == {
+        "provider": "Vercel", "production_url": "https://argos-hub.vercel.app",
+        "trigger": "automatic on git push to master",
+    }
+
+
+def test_missing_deploy_object_defaults_to_empty_dict(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("hub")
+    assert isinstance(result, ProjectContext)
+    assert result.deploy == {}
+
+
 def test_commands_as_int_is_structured_error(tmp_path):
     index_path = tmp_path / "project_context_index.json"
     index_path.write_text(json.dumps(_index_with_bad_project_field("commands", 42)), encoding="utf-8")
