@@ -35,6 +35,7 @@ class ProjectContext:
     default_branch: str | None = None
     task_source: str | None = None
     warnings: list[str] = field(default_factory=list)
+    deploy: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,11 @@ class ProjectResolver:
                 return ResolveError(
                     reason=f"indice invalido: 'commands' do projeto '{canonical_id}' deveria ser um objeto (dict)"
                 )
+            deploy = project.get("deploy")
+            if deploy is not None and not isinstance(deploy, dict):
+                return ResolveError(
+                    reason=f"indice invalido: 'deploy' do projeto '{canonical_id}' deveria ser um objeto (dict)"
+                )
 
         return None
 
@@ -208,6 +214,11 @@ class ProjectResolver:
             default_branch=project.get("default_branch_seen"),
             task_source=project.get("task_source"),
             warnings=list(project.get("warnings") or []),
+            # Additive (#38): a structured "deploy" object (provider,
+            # production_url, trigger) is only present for SOME index
+            # entries - the freeform commands["deploy"] string above
+            # remains the universal fallback every project has.
+            deploy=dict(project.get("deploy") or {}),
         )
 
     @staticmethod
