@@ -435,6 +435,119 @@ def test_daily_cycle_reassigns_reviewer_when_it_collides_with_the_resolved_imple
     assert store.get_task(task.id).reviewer_preference == AgentName.CODEX
 
 
+def test_daily_cycle_reconciles_lost_response_after_retry_with_stable_identity(store, monkeypatch):
+    # Review Task #131 round 3, finding #1: a POST whose response was
+    # lost (timeout) must still reconcile on a later retry, using the
+    # EXACT same identity (agent + title/description) it committed to
+    # the first time - even if availability changes or the local task is
+    # edited in the meantime. Real PaperclipSession against a faked HTTP
+    # transport, since this exercises #18's own reconciliation logic.
+    class Response:
+        def __init__(self, payload, status=200):
+            self.payload, self.status_code, self.text = payload, status, "response"
+
+        def json(self):
+            return self.payload
+
+    class Transport:
+        def __init__(self):
+            self.tasks = []
+            self.lose_response = False
+
+        def get(self, url, **kwargs):
+            return Response(list(self.tasks))
+
+        def post(self, url, **kwargs):
+            created = {"id": f"pc-{len(self.tasks) + 1}", "status": "backlog", **kwargs["json"]}
+            self.tasks.append(created)
+            if self.lose_response:
+                raise pc.requests.exceptions.Timeout()
+            return Response(created, 201)
+
+    transport = Transport()
+    monkeypatch.setattr(pc.requests, "get", transport.get)
+    monkeypatch.setattr(pc.requests, "post", transport.post)
+    monkeypatch.setattr(pc, "_CONFIG_TOKEN", "")
+    monkeypatch.delenv("PAPERCLIP_API_TOKEN", raising=False)
+
+    task = _task(title="Original title", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, fallback_agent=AgentName.CODEX,
+                agent_class=AgentClass.CLAUDE)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    # PaperclipSession's OWN cooldown/backoff (real time.monotonic by
+    # default) would otherwise short-circuit the second call before it
+    # ever reaches create_task_idempotent - inject a controllable one.
+    class MonotonicClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    mono = MonotonicClock()
+    paperclip = PaperclipSession(
+        config=OrchestratorConfig(paperclip_base_url="http://paperclip.invalid"), clock=mono,
+    )
+
+    transport.lose_response = True
+    first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                            company_id="acme", clock=clock)
+    assert task.id in first.dispatch_incomplete_task_ids
+    assert len(transport.tasks) == 1  # the POST DID land server-side
+    assert transport.tasks[0]["assigneeAgentId"] == "agent-claude"
+
+    mark_rate_limited(store, AgentName.CLAUDE, "quota")  # Claude now in cooldown
+    task.title = "Edited title"  # a local edit must not matter either
+    store.save_task(task)
+    transport.lose_response = False  # server reachable again
+    mono.value += OrchestratorConfig().retry_interval_seconds + 1  # past the session's backoff
+
+    second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert task.id in second.assigned_task_ids
+    assert len(transport.tasks) == 1  # reconciled, never a second POST
+    assert transport.tasks[0]["assigneeAgentId"] == "agent-claude"  # original identity, not agent-codex
+
+
+def test_daily_cycle_never_dispatches_a_task_that_moved_out_of_ready_mid_pass(store, monkeypatch):
+    # Review Task #131 round 3, finding #2: a concurrent writer moving
+    # the task on (here, simulated as a side effect of the external
+    # find_agent call) must result in a skipped dispatch, never a commit
+    # against the stale outer snapshot, and never a reviewer mutation on
+    # now-active work.
+    task = _task(title="Snatched by another worker", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, agent_class=AgentClass.CLAUDE,
+                reviewer_preference=AgentName.CLAUDE)
+    store.save_task(task)
+
+    def sneaky_find_agent(name_query, *, company_id=None, base_url=None, timeout=None):
+        current = store.get_task(task.id)
+        current.state = TaskState.IN_REVIEW
+        store.save_task(current)
+        return {"id": f"agent-{name_query.lower()}", "_company_id": company_id}, None
+
+    monkeypatch.setattr("orchestrator.orchestrator.paperclip_client.find_agent", sneaky_find_agent)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    result = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert paperclip.created == []  # never dispatched the stale snapshot
+    assert task.id in result.dispatch_incomplete_task_ids
+    current = store.get_task(task.id)
+    assert current.state == TaskState.IN_REVIEW  # untouched
+    assert current.reviewer_preference == AgentName.CLAUDE  # untouched, no fixup on stale work
+
+
 def test_daily_cycle_reconsiders_next_cycle_task_once_its_dependency_finishes_same_day(store):
     # Review Task #131 round 2, finding #4: a NEXT_CYCLE task whose
     # dependency finishes AFTER on_cycle_start's own once-per-day scan

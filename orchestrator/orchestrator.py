@@ -32,7 +32,7 @@ from orchestrator.github_client import GitHubClient
 from orchestrator.healthcheck import IdleDiagnosis, check_idle
 from orchestrator.history import diff_since
 from orchestrator.models import AgentName, Task, TaskState
-from orchestrator.paperclip_ops import PaperclipSession, get_existing_assignment
+from orchestrator.paperclip_ops import PaperclipSession
 from orchestrator.persistence import Store
 from orchestrator.planner import PlanResult
 from orchestrator.scheduler import Scheduler
@@ -105,27 +105,95 @@ def _resolve_agent_id(name: str, company_id: str, session: PaperclipSession) -> 
     return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
-def _ensure_distinct_reviewer(store: Store, task_id: str, implementer: AgentName, now: datetime) -> None:
-    """A dispatched task's reviewer must stay distinct from whoever
-    actually implements it (#24/#29's cross-review requirement).
-    Resolving `implementer` here (availability-driven, possibly EITHER
-    resolved to a concrete agent) can land on the exact agent
-    `task.reviewer_preference` already names - fixed up and persisted the
-    same way #26's own cooldown redirect does, re-reading the current row
-    fresh inside a transaction rather than trusting a possibly-stale
-    caller snapshot (Review Task #131 round 2, finding #1)."""
-    def apply(connection) -> None:
+_DISPATCH_INTENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS orchestrator_dispatch_intent (
+    company_id TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    PRIMARY KEY (company_id, correlation_id)
+);
+"""
+
+
+def _load_dispatch_intent(store: Store, company_id: str, correlation_id: str) -> tuple[str, str, str] | None:
+    """Returns the (agent_id, title, description) already committed to for
+    this dispatch, if any - see `_reserve_dispatch_intent`."""
+    store.ensure_schema(_DISPATCH_INTENT_SCHEMA)
+    rows = store.query(
+        "SELECT agent_id, title, description FROM orchestrator_dispatch_intent "
+        "WHERE company_id = ? AND correlation_id = ?",
+        (company_id, correlation_id),
+    )
+    return rows[0] if rows else None
+
+
+def _reserve_dispatch_intent(
+    store: Store, company_id: str, task_id: str, project_context, implementer: AgentName,
+    agent_id: str, title: str, description: str, now: datetime,
+) -> tuple[str, str, str] | None:
+    """Commits ONE stable dispatch identity (agent + exact title/
+    description) for this task, the first and only time it is ever
+    decided, transactionally re-validating the task is STILL genuinely
+    eligible right before that commit - closing two round-3 findings at
+    once:
+
+    Finding #1 (association incomplete for recovery): the previous
+    design only remembered an agent id AFTER #18's own create confirmed
+    it, so a POST whose response was lost (timeout) left nothing to
+    reconcile from, and a retry - now resolving a DIFFERENT agent because
+    the original one had since gone into cooldown, or using an
+    in-the-meantime-edited local title - built a DIFFERENT fingerprint
+    and hit #18's own `correlation_conflict` instead of reconciling.
+    `orchestrator_dispatch_intent` is written BEFORE the first
+    `create_task_idempotent` attempt and reused VERBATIM on every later
+    call for this correlation_id (see `_load_dispatch_intent`) - #18's
+    own reconciliation (querying the remote by marker) then naturally
+    resolves an uncertain outcome, since the fingerprint never changes.
+    A task with an existing intent is dispatched again with NO renewed
+    availability requirement - the decision was already made; only a
+    truly NEW dispatch decision needs a free agent.
+
+    Finding #2 (stale snapshot dispatched, reviewer clobbered on active
+    work): this module's outer `dispatchable` list is a snapshot that can
+    go stale during a slow external call (e.g. `find_agent`) elsewhere in
+    the same pass, while a concurrent writer moves the task on (a review
+    started, a human edit). The current row is re-read fresh here, and
+    dispatch is refused (returns None, no mutation, no intent written)
+    unless it is STILL READY, in THIS project, with every dependency
+    STILL DONE - the reviewer-distinctness fixup (same as before) only
+    ever applies to a task that passes this same fresh check, so active
+    work (e.g. already IN_REVIEW) is never touched.
+    """
+    def apply(connection):
         row = connection.execute("SELECT data FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
-            return
+            return None
         current = Task.from_dict(json.loads(row[0]))
-        if current.reviewer_preference != implementer:
-            return
-        current.reviewer_preference = AgentName.CODEX if implementer == AgentName.CLAUDE else AgentName.CLAUDE
-        current.updated_at = now
-        connection.execute("UPDATE tasks SET data = ? WHERE id = ?", (json.dumps(current.to_dict()), task_id))
+        if current.state != TaskState.READY or current.project_id != project_context.canonical_id:
+            return None
+        for dep_id in current.dependencies:
+            dep_row = connection.execute("SELECT state FROM tasks WHERE id = ?", (dep_id,)).fetchone()
+            if dep_row is None or dep_row[0] != TaskState.DONE.value:
+                return None
+        if current.reviewer_preference == implementer:
+            current.reviewer_preference = AgentName.CODEX if implementer == AgentName.CLAUDE else AgentName.CLAUDE
+            current.updated_at = now
+            connection.execute("UPDATE tasks SET data = ? WHERE id = ?", (json.dumps(current.to_dict()), task_id))
+        connection.execute(
+            "INSERT OR IGNORE INTO orchestrator_dispatch_intent "
+            "(company_id, correlation_id, agent_id, title, description) VALUES (?, ?, ?, ?, ?)",
+            (company_id, current.correlation_id, agent_id, title, description),
+        )
+        return connection.execute(
+            "SELECT agent_id, title, description FROM orchestrator_dispatch_intent "
+            "WHERE company_id = ? AND correlation_id = ?",
+            (company_id, current.correlation_id),
+        ).fetchone()
 
-    store.run_in_transaction(apply)
+    store.ensure_schema(_DISPATCH_INTENT_SCHEMA)
+    return store.run_in_transaction(apply)
 
 
 def run_daily_cycle(
@@ -176,33 +244,44 @@ def run_daily_cycle(
     a READY task with a since-invalidated/missing dependency is never
     dispatched, and urgent/high work is handed out before low/medium.
 
-    Assignment (round 2, findings #1-#3): a Paperclip task is only
-    created for a task with a REAL free concrete agent
-    (`_concrete_available_agent`, which now checks actual availability
-    even for a task naming no preference at all - the previous version
-    let such a task dispatch with no assignee even with both agents in
-    cooldown). Its Paperclip agent id is resolved via `_resolve_agent_id`
-    - scoped to `company_id` and to the session's own server, never a
-    same-named agent from a different company. An id already committed
-    for this task's correlation_id (`get_existing_assignment`) is always
-    reused rather than re-resolved: #18's own create is idempotent by a
-    fingerprint that includes the assignee, so choosing a DIFFERENT agent
-    on a later cycle (e.g. the original assignee went into cooldown by
-    then) would conflict against the already-created remote task, not
-    reassign it - reassignment is a distinct, explicit operation this
-    function does not perform. A resolved implementer colliding with
-    `task.reviewer_preference` is fixed up via `_ensure_distinct_reviewer`
-    before dispatch, preserving #24/#29's cross-review requirement. The
-    assignment is INDEPENDENTLY confirmed afterward via `get_task_status`,
-    comparing against the SPECIFIC id just assigned (not any non-empty
-    value) - a task with no resolvable identity, or created but not
-    confirmed with THIS id, is reported in `dispatch_incomplete_task_ids`,
-    never silently counted as progress. `check_idle`'s later diagnosis
-    does not substitute for this: its own grace period can hide exactly
-    this kind of immediate dispatch failure. `paperclip_client.find_agent`/
-    `resume_agent` exist, but resuming a deliberately paused agent to
-    force an assignment is out of scope - no such endpoint is invented
-    here.
+    Assignment (round 2 findings #1-#3, round 3 findings #1-#2): a
+    Paperclip task is only created for a task with a REAL free concrete
+    agent (`_concrete_available_agent`, which checks actual availability
+    even for a task naming no preference at all). Its Paperclip agent id
+    is resolved via `_resolve_agent_id` - scoped to `company_id` and to
+    the session's own server, never a same-named agent from a different
+    company. That decision (agent id + the EXACT title/description used)
+    is committed exactly once as a durable `orchestrator_dispatch_intent`
+    row (`_reserve_dispatch_intent`) and reused VERBATIM on every later
+    call for the same correlation_id (`_load_dispatch_intent`) - never
+    re-decided. This closes two things at once: #18's own create is
+    idempotent by a fingerprint that includes title/description/assignee,
+    so re-deciding on a retry (a different agent because the original
+    went into cooldown, or a locally-edited title) built a DIFFERENT
+    fingerprint and hit `correlation_conflict` instead of reconciling; and
+    a POST whose response was lost (timeout) left nothing to reconcile
+    from until the SAME fingerprint was retried, which a fresh decision
+    would never reproduce. Reassignment to a different agent stays a
+    distinct, unimplemented operation. `_reserve_dispatch_intent` commits
+    only after re-validating - inside the SAME transaction - that the
+    task is STILL READY, still in this project, with every dependency
+    STILL DONE, and only then fixes up a `task.reviewer_preference`
+    collision (#24/#29's cross-review requirement): a stale outer
+    `dispatchable` snapshot can otherwise go stale during a slow external
+    call elsewhere in this same pass, letting a concurrent writer move
+    the task on (e.g. into an active review) before this commits - the
+    fresh re-check refuses dispatch (and any mutation) for a task that
+    is no longer genuinely eligible, rather than acting on the stale
+    snapshot. The assignment is INDEPENDENTLY confirmed afterward via
+    `get_task_status`, comparing against the SPECIFIC id just used (not
+    any non-empty value) - a task with no resolvable identity, no longer
+    eligible, or created but not confirmed with THIS id, is reported in
+    `dispatch_incomplete_task_ids`, never silently counted as progress.
+    `check_idle`'s later diagnosis does not substitute for this: its own
+    grace period can hide exactly this kind of immediate dispatch
+    failure. `paperclip_client.find_agent`/`resume_agent` exist, but
+    resuming a deliberately paused agent to force an assignment is out of
+    scope - no such endpoint is invented here.
 
     GitHub materialization (finding #5): `materialize_plan` is now always
     called for this project's dispatchable tasks (never gated behind
@@ -243,31 +322,31 @@ def run_daily_cycle(
     dispatch_incomplete: list[str] = []
     if paperclip_session is not None and company_id is not None:
         for task in dispatchable:
-            resolved_agent = _concrete_available_agent(store, task, clock)
-            if resolved_agent is None:
-                dispatch_incomplete.append(task.id)  # every concrete candidate is in cooldown - #26
-                continue
-
-            # An EXISTING assignment is authoritative once it exists: its
-            # implementer identity was already fixed up (below) the cycle
-            # it was first created, and #18's own fingerprint would treat
-            # a DIFFERENT agent id for the same correlation_id as a
-            # conflict, not a reassignment - so a fresh (possibly
-            # different) `resolved_agent` is never applied to reviewer
-            # fixup on a reuse.
-            agent_id = get_existing_assignment(
-                company_id, task.correlation_id, store=store, config=paperclip_session.config,
-            )
-            if agent_id is None:
+            # An EXISTING intent is authoritative and reused VERBATIM,
+            # with no renewed availability requirement - the decision was
+            # already made once; only a genuinely NEW dispatch needs a
+            # free agent (Review Task #131 round 3, finding #1).
+            intent = _load_dispatch_intent(store, company_id, task.correlation_id)
+            if intent is None:
+                resolved_agent = _concrete_available_agent(store, task, clock)
+                if resolved_agent is None:
+                    dispatch_incomplete.append(task.id)  # every concrete candidate is in cooldown - #26
+                    continue
                 agent_id = _resolve_agent_id(resolved_agent.value, company_id, paperclip_session)
-                if agent_id is not None:
-                    _ensure_distinct_reviewer(store, task.id, resolved_agent, now)
-            if agent_id is None:
-                dispatch_incomplete.append(task.id)  # no valid, same-company identity resolvable
-                continue
+                if agent_id is None:
+                    dispatch_incomplete.append(task.id)  # no valid, same-company identity resolvable
+                    continue
+                intent = _reserve_dispatch_intent(
+                    store, company_id, task.id, project_context, resolved_agent,
+                    agent_id, task.title, task.objective, now,
+                )
+                if intent is None:
+                    dispatch_incomplete.append(task.id)  # no longer eligible - concurrent change
+                    continue
 
+            agent_id, title, description = intent
             result = paperclip_session.create_task_idempotent(
-                company_id, task.title, task.objective, task.correlation_id, agent_id, store=store,
+                company_id, title, description, task.correlation_id, agent_id, store=store,
             )
             if not result.get("available"):
                 dispatch_incomplete.append(task.id)
