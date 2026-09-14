@@ -4,9 +4,10 @@ The SINGLE contact point between the ~2000-line main.py monolith and this
 package (PROMPT MESTRE V2 section 6/56) - main.py never imports any other
 orchestrator module directly for voice. Every function here is a stub for
 now: it always returns a clear "under construction" answer rather than
-real orchestration data. The real implementations land with #27 (Wave 4),
-which reuses these exact same signatures - main.py's own call sites are
-not expected to change when that happens.
+real orchestration data. The real implementations land with #35 (Wave 4,
+"Integração de voz: respostas reais no facade"), which reuses these
+exact same signatures - main.py's own call sites are not expected to
+change when that happens.
 """
 from __future__ import annotations
 
