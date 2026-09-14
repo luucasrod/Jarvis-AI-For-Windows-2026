@@ -107,64 +107,94 @@ def _resolve_agent_id(name: str, company_id: str, session: PaperclipSession) -> 
 
 _DISPATCH_INTENT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS orchestrator_dispatch_intent (
+    server TEXT NOT NULL,
     company_id TEXT NOT NULL,
     correlation_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
+    implementer TEXT NOT NULL,
     title TEXT NOT NULL,
     description TEXT NOT NULL,
-    PRIMARY KEY (company_id, correlation_id)
+    PRIMARY KEY (server, company_id, correlation_id)
 );
 """
 
 
-def _load_dispatch_intent(store: Store, company_id: str, correlation_id: str) -> tuple[str, str, str] | None:
+def _dispatch_server(session: PaperclipSession) -> str:
+    """Normalizes the session's own base_url the SAME way #18 does for its
+    own fingerprint (`.rstrip('/')`) - the server is part of a dispatch
+    intent's identity (Review Task #131 round 4, finding #1): reusing an
+    agent id resolved on one Paperclip server against a DIFFERENT one
+    (e.g. this Store/task/company reused across a server migration) would
+    silently send an id that was never looked up there at all."""
+    return session.config.paperclip_base_url.rstrip('/')
+
+
+def _load_dispatch_intent(
+    store: Store, server: str, company_id: str, correlation_id: str,
+) -> tuple[str, str, str] | None:
     """Returns the (agent_id, title, description) already committed to for
-    this dispatch, if any - see `_reserve_dispatch_intent`."""
+    this dispatch on THIS server, if any - see `_reserve_dispatch_intent`."""
     store.ensure_schema(_DISPATCH_INTENT_SCHEMA)
     rows = store.query(
         "SELECT agent_id, title, description FROM orchestrator_dispatch_intent "
-        "WHERE company_id = ? AND correlation_id = ?",
-        (company_id, correlation_id),
+        "WHERE server = ? AND company_id = ? AND correlation_id = ?",
+        (server, company_id, correlation_id),
     )
     return rows[0] if rows else None
 
 
 def _reserve_dispatch_intent(
-    store: Store, company_id: str, task_id: str, project_context, implementer: AgentName,
+    store: Store, server: str, company_id: str, task_id: str, project_context, implementer: AgentName,
     agent_id: str, title: str, description: str, now: datetime,
 ) -> tuple[str, str, str] | None:
-    """Commits ONE stable dispatch identity (agent + exact title/
+    """Commits ONE stable dispatch identity (server + agent + exact title/
     description) for this task, the first and only time it is ever
     decided, transactionally re-validating the task is STILL genuinely
-    eligible right before that commit - closing two round-3 findings at
-    once:
+    eligible right before that commit - closing findings from rounds 3
+    and 4:
 
-    Finding #1 (association incomplete for recovery): the previous
-    design only remembered an agent id AFTER #18's own create confirmed
-    it, so a POST whose response was lost (timeout) left nothing to
-    reconcile from, and a retry - now resolving a DIFFERENT agent because
-    the original one had since gone into cooldown, or using an
-    in-the-meantime-edited local title - built a DIFFERENT fingerprint
-    and hit #18's own `correlation_conflict` instead of reconciling.
-    `orchestrator_dispatch_intent` is written BEFORE the first
-    `create_task_idempotent` attempt and reused VERBATIM on every later
-    call for this correlation_id (see `_load_dispatch_intent`) - #18's
-    own reconciliation (querying the remote by marker) then naturally
-    resolves an uncertain outcome, since the fingerprint never changes.
-    A task with an existing intent is dispatched again with NO renewed
-    availability requirement - the decision was already made; only a
-    truly NEW dispatch decision needs a free agent.
+    Round 3 finding #1 (association incomplete for recovery): the
+    previous design only remembered an agent id AFTER #18's own create
+    confirmed it, so a POST whose response was lost (timeout) left
+    nothing to reconcile from, and a retry - now resolving a DIFFERENT
+    agent because the original one had since gone into cooldown, or
+    using an in-the-meantime-edited local title - built a DIFFERENT
+    fingerprint and hit #18's own `correlation_conflict` instead of
+    reconciling. `orchestrator_dispatch_intent` is written BEFORE the
+    first `create_task_idempotent` attempt and reused VERBATIM on every
+    later call for this (server, company_id, correlation_id) (see
+    `_load_dispatch_intent`) - #18's own reconciliation (querying the
+    remote by marker) then naturally resolves an uncertain outcome, since
+    the fingerprint never changes. A task with an existing intent is
+    dispatched again with NO renewed availability requirement - the
+    decision was already made; only a truly NEW dispatch decision needs a
+    free agent.
 
-    Finding #2 (stale snapshot dispatched, reviewer clobbered on active
-    work): this module's outer `dispatchable` list is a snapshot that can
-    go stale during a slow external call (e.g. `find_agent`) elsewhere in
-    the same pass, while a concurrent writer moves the task on (a review
-    started, a human edit). The current row is re-read fresh here, and
-    dispatch is refused (returns None, no mutation, no intent written)
-    unless it is STILL READY, in THIS project, with every dependency
-    STILL DONE - the reviewer-distinctness fixup (same as before) only
-    ever applies to a task that passes this same fresh check, so active
-    work (e.g. already IN_REVIEW) is never touched.
+    Round 3 finding #2 (stale snapshot dispatched, reviewer clobbered on
+    active work): this module's outer `dispatchable` list is a snapshot
+    that can go stale during a slow external call (e.g. `find_agent`)
+    elsewhere in the same pass, while a concurrent writer moves the task
+    on (a review started, a human edit). The current row is re-read fresh
+    here, and dispatch is refused (returns None, no mutation, no intent
+    written) unless it is STILL READY, in THIS project, with every
+    dependency STILL DONE.
+
+    Round 4 finding #1: `server` is now part of the intent's own identity
+    (see `_dispatch_server`) - a Store/task/company reused against a
+    different Paperclip server never inherits an id resolved on the old
+    one.
+
+    Round 4 finding #2 (losing reservation could still force self-review):
+    two concurrent callers resolving DIFFERENT candidate implementers for
+    the same never-yet-reserved correlation_id could previously each
+    apply their OWN reviewer fixup - `run_in_transaction`'s BEGIN
+    IMMEDIATE genuinely serializes the two attempts, so the loser's
+    transaction runs strictly after the winner's already committed; an
+    EXISTING intent is now always read FIRST, before any reviewer
+    mutation, and a loser fixes up against the WINNING intent's own
+    persisted `implementer` - never its own losing candidate. Only the
+    actual winner (no existing intent found) ever picks an implementer at
+    all.
     """
     def apply(connection):
         row = connection.execute("SELECT data FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -177,19 +207,36 @@ def _reserve_dispatch_intent(
             dep_row = connection.execute("SELECT state FROM tasks WHERE id = ?", (dep_id,)).fetchone()
             if dep_row is None or dep_row[0] != TaskState.DONE.value:
                 return None
+
+        existing = connection.execute(
+            "SELECT agent_id, title, description, implementer FROM orchestrator_dispatch_intent "
+            "WHERE server = ? AND company_id = ? AND correlation_id = ?",
+            (server, company_id, current.correlation_id),
+        ).fetchone()
+        if existing is not None:
+            won_implementer = AgentName(existing[3])
+            if current.reviewer_preference == won_implementer:
+                current.reviewer_preference = (
+                    AgentName.CODEX if won_implementer == AgentName.CLAUDE else AgentName.CLAUDE
+                )
+                current.updated_at = now
+                connection.execute("UPDATE tasks SET data = ? WHERE id = ?", (json.dumps(current.to_dict()), task_id))
+            return existing[0], existing[1], existing[2]
+
         if current.reviewer_preference == implementer:
             current.reviewer_preference = AgentName.CODEX if implementer == AgentName.CLAUDE else AgentName.CLAUDE
             current.updated_at = now
             connection.execute("UPDATE tasks SET data = ? WHERE id = ?", (json.dumps(current.to_dict()), task_id))
         connection.execute(
             "INSERT OR IGNORE INTO orchestrator_dispatch_intent "
-            "(company_id, correlation_id, agent_id, title, description) VALUES (?, ?, ?, ?, ?)",
-            (company_id, current.correlation_id, agent_id, title, description),
+            "(server, company_id, correlation_id, agent_id, implementer, title, description) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (server, company_id, current.correlation_id, agent_id, implementer.value, title, description),
         )
         return connection.execute(
             "SELECT agent_id, title, description FROM orchestrator_dispatch_intent "
-            "WHERE company_id = ? AND correlation_id = ?",
-            (company_id, current.correlation_id),
+            "WHERE server = ? AND company_id = ? AND correlation_id = ?",
+            (server, company_id, current.correlation_id),
         ).fetchone()
 
     store.ensure_schema(_DISPATCH_INTENT_SCHEMA)
@@ -321,12 +368,13 @@ def run_daily_cycle(
     assigned: list[str] = []
     dispatch_incomplete: list[str] = []
     if paperclip_session is not None and company_id is not None:
+        server = _dispatch_server(paperclip_session)
         for task in dispatchable:
             # An EXISTING intent is authoritative and reused VERBATIM,
             # with no renewed availability requirement - the decision was
             # already made once; only a genuinely NEW dispatch needs a
             # free agent (Review Task #131 round 3, finding #1).
-            intent = _load_dispatch_intent(store, company_id, task.correlation_id)
+            intent = _load_dispatch_intent(store, server, company_id, task.correlation_id)
             if intent is None:
                 resolved_agent = _concrete_available_agent(store, task, clock)
                 if resolved_agent is None:
@@ -337,7 +385,7 @@ def run_daily_cycle(
                     dispatch_incomplete.append(task.id)  # no valid, same-company identity resolvable
                     continue
                 intent = _reserve_dispatch_intent(
-                    store, company_id, task.id, project_context, resolved_agent,
+                    store, server, company_id, task.id, project_context, resolved_agent,
                     agent_id, task.title, task.objective, now,
                 )
                 if intent is None:

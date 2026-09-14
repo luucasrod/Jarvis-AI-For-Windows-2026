@@ -5,6 +5,7 @@ pass, plus run_cutoff and run_report/mark_report_delivered.
 """
 import json
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,7 +16,13 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.events import EventType, emit
 from orchestrator.github_client import GitHubClient
 from orchestrator.models import AgentClass, AgentName, ExecutionMode, Task, TaskState
-from orchestrator.orchestrator import mark_report_delivered, run_cutoff, run_daily_cycle, run_report
+from orchestrator.orchestrator import (
+    _reserve_dispatch_intent,
+    mark_report_delivered,
+    run_cutoff,
+    run_daily_cycle,
+    run_report,
+)
 from orchestrator.paperclip_ops import PaperclipSession
 from orchestrator.persistence import Store
 from orchestrator.project_resolver import ProjectContext
@@ -546,6 +553,70 @@ def test_daily_cycle_never_dispatches_a_task_that_moved_out_of_ready_mid_pass(st
     current = store.get_task(task.id)
     assert current.state == TaskState.IN_REVIEW  # untouched
     assert current.reviewer_preference == AgentName.CLAUDE  # untouched, no fixup on stale work
+
+
+def test_daily_cycle_never_reuses_dispatch_intent_across_a_different_paperclip_server(store, monkeypatch):
+    # Review Task #131 round 4, finding #1: an identity resolved on one
+    # Paperclip server must never be reused against a different one.
+    def tracking_find_agent(name, *, company_id=None, base_url=None, timeout=None):
+        return {"id": f"agent-{name.lower()}-{base_url}", "_company_id": company_id}, None
+
+    monkeypatch.setattr("orchestrator.orchestrator.paperclip_client.find_agent", tracking_find_agent)
+
+    task = _task(title="Cross-server task", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, agent_class=AgentClass.CLAUDE)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+
+    session_a = FakePaperclipSession(config=OrchestratorConfig(paperclip_base_url="http://server-a"))
+    run_daily_cycle(store, PROJECT, client=client, paperclip_session=session_a,
+                    company_id="acme", clock=clock)
+    assert session_a.created[-1][3] == "agent-claude-http://server-a"
+
+    session_b = FakePaperclipSession(config=OrchestratorConfig(paperclip_base_url="http://server-b"))
+    run_daily_cycle(store, PROJECT, client=client, paperclip_session=session_b,
+                    company_id="acme", clock=clock)
+
+    # A FRESH, server-b-scoped lookup - never server-a's cached identity.
+    assert session_b.created[-1][3] == "agent-claude-http://server-b"
+
+
+def test_reserve_dispatch_intent_losing_call_defers_reviewer_fixup_to_the_winner(store):
+    # Review Task #131 round 4, finding #2: two concurrent reservations
+    # for the SAME task resolving DIFFERENT candidate implementers must
+    # never both apply their own reviewer fixup - the loser must defer to
+    # the ACTUAL winning implementer, never causing self-review.
+    task = _task(title="Contested dispatch", state=TaskState.READY, reviewer_preference=AgentName.EITHER)
+    store.save_task(task)
+    now = datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc)
+
+    results = {}
+    start = threading.Barrier(2)
+
+    def reserve(key, implementer, agent_id):
+        start.wait(timeout=5)
+        results[key] = _reserve_dispatch_intent(
+            store, "http://paperclip.invalid", "acme", task.id, PROJECT, implementer,
+            agent_id, task.title, task.objective, now,
+        )
+
+    t1 = threading.Thread(target=reserve, args=("claude", AgentName.CLAUDE, "agent-claude"))
+    t2 = threading.Thread(target=reserve, args=("codex", AgentName.CODEX, "agent-codex"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    # Both callers observed the SAME winning intent - exactly one identity won.
+    assert results["claude"] == results["codex"]
+    winning_agent_id = results["claude"][0]
+    winning_implementer = AgentName.CLAUDE if winning_agent_id == "agent-claude" else AgentName.CODEX
+
+    final_reviewer = store.get_task(task.id).reviewer_preference
+    assert final_reviewer != winning_implementer  # never self-review
 
 
 def test_daily_cycle_reconsiders_next_cycle_task_once_its_dependency_finishes_same_day(store):
