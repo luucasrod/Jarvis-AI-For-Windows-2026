@@ -9,7 +9,7 @@ import requests
 
 import paperclip_client as client
 from orchestrator.config import OrchestratorConfig
-from orchestrator.paperclip_ops import create_task_idempotent, get_task_status
+from orchestrator.paperclip_ops import create_task_idempotent, get_existing_assignment, get_task_status
 from orchestrator.persistence import Store
 
 CONFIG = OrchestratorConfig(paperclip_base_url='http://paperclip.invalid', paperclip_timeout_seconds=2.5)
@@ -203,6 +203,32 @@ def test_status_success_missing_and_invalid(store, transport):
 def test_status_transport_errors(transport, exception, reason):
     transport.get_error = exception
     assert get_task_status('company', 'pc-1', config=CONFIG)['reason'] == reason
+
+
+def test_get_existing_assignment_returns_none_before_any_creation(store, transport):
+    assert get_existing_assignment('company', 'corr', store=store, config=CONFIG) is None
+
+
+def test_get_existing_assignment_returns_the_committed_assignee(store, transport):
+    create(store, assignee_agent_id='agent-claude')
+    assert get_existing_assignment('company', 'corr', store=store, config=CONFIG) == 'agent-claude'
+
+
+def test_get_existing_assignment_is_none_when_created_without_one(store, transport):
+    create(store, assignee_agent_id=None)
+    assert get_existing_assignment('company', 'corr', store=store, config=CONFIG) is None
+
+
+def test_get_existing_assignment_stays_stable_across_a_later_conflicting_call(store, transport):
+    # The exact scenario Review Task #131 round 2 asked to close: the
+    # remote assignee committed on the FIRST call must be reused, not
+    # silently changed - a later call attempting a different
+    # assignee_agent_id for the SAME correlation_id conflicts (#18's own
+    # fingerprint), it never overwrites what was actually committed.
+    create(store, assignee_agent_id='agent-claude')
+    conflicting = create(store, assignee_agent_id='agent-codex')
+    assert conflicting['reason'] == 'correlation_conflict'
+    assert get_existing_assignment('company', 'corr', store=store, config=CONFIG) == 'agent-claude'
 
 
 @pytest.mark.parametrize('payload', [None, {}, [None], [{'id': 123}]])

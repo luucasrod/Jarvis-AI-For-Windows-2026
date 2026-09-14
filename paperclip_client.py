@@ -198,28 +198,42 @@ def _post(path: str, body: dict | None = None, *, base_url: str | None = None,
         return {}, None
 
 
-def find_agent(name_query: str) -> tuple[dict | None, str | None]:
+def find_agent(name_query: str, *, company_id: str | None = None,
+               base_url: str | None = None, timeout: float | None = None) -> tuple[dict | None, str | None]:
     """Procura um agente pelo nome (exato, case-insensitive; se não achar
-    exato, aceita substring) em todas as empresas.
+    exato, aceita substring). Sem `company_id`, busca em todas as
+    empresas (comportamento histórico); com `company_id`, restringe a
+    busca a essa empresa específica - um caller que já sabe em qual
+    empresa deve despachar deve sempre passar isto, para nunca aceitar
+    um agente de mesmo nome de OUTRA empresa (issue #30, Review Task
+    #131 round 2, achado #2). `base_url`/`timeout` seguem o mesmo padrão
+    já usado por `list_company_tasks`/`create_task`, para um caller com
+    sua própria sessão/configuração (ex.: `PaperclipSession`) consultar o
+    MESMO servidor que usa para tudo o mais, em vez da configuração
+    global deste módulo.
     Devolve (agente_com__company_id, erro) — só um dos dois é not-None."""
-    companies, err = _get("/api/companies")
-    if err:
-        return None, err
-    if not isinstance(companies, list):
-        return None, "resposta inesperada do Paperclip"
+    if company_id is not None:
+        company_ids = [company_id]
+    else:
+        companies, err = _get("/api/companies", base_url=base_url, timeout=timeout)
+        if err:
+            return None, err
+        if not isinstance(companies, list):
+            return None, "resposta inesperada do Paperclip"
+        company_ids = [c["id"] for c in companies if isinstance(c, dict) and "id" in c]
 
     q = name_query.strip().lower()
     partial_match = None
-    for c in companies:
-        agents, a_err = _get(f"/api/companies/{c['id']}/agents")
+    for cid in company_ids:
+        agents, a_err = _get(f"/api/companies/{cid}/agents", base_url=base_url, timeout=timeout)
         if not isinstance(agents, list):
             continue
         for a in agents:
             a_name = (a.get("name") or "").strip().lower()
             if a_name == q:
-                return {**a, "_company_id": c["id"]}, None
+                return {**a, "_company_id": cid}, None
             if partial_match is None and (q in a_name or a_name in q):
-                partial_match = {**a, "_company_id": c["id"]}
+                partial_match = {**a, "_company_id": cid}
 
     if partial_match:
         return partial_match, None

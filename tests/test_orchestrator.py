@@ -9,11 +9,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import paperclip_client as pc
 from orchestrator.agent_availability import mark_rate_limited
+from orchestrator.config import OrchestratorConfig
 from orchestrator.events import EventType, emit
 from orchestrator.github_client import GitHubClient
 from orchestrator.models import AgentClass, AgentName, ExecutionMode, Task, TaskState
 from orchestrator.orchestrator import mark_report_delivered, run_cutoff, run_daily_cycle, run_report
+from orchestrator.paperclip_ops import PaperclipSession
 from orchestrator.persistence import Store
 from orchestrator.project_resolver import ProjectContext
 
@@ -62,9 +65,10 @@ class FakePaperclipSession:
     call but never actually reflecting an assignee (Review Task #131
     finding #4's fake)."""
 
-    def __init__(self, *, available=True, confirm_assignment=True):
+    def __init__(self, *, available=True, confirm_assignment=True, config=None):
         self.available = available
         self.confirm_assignment = confirm_assignment
+        self.config = config or OrchestratorConfig()
         self.created = []  # (company_id, title, correlation_id, assignee_agent_id)
         self._tasks = {}
 
@@ -88,8 +92,8 @@ class FakePaperclipSession:
         return {"available": True, "task_id": task_id, "status": "open", "task": task}
 
 
-def _fake_find_agent(name_query):
-    return {"id": f"agent-{name_query.lower()}"}, None
+def _fake_find_agent(name_query, *, company_id=None, base_url=None, timeout=None):
+    return {"id": f"agent-{name_query.lower()}", "_company_id": company_id}, None
 
 
 def _task(**overrides):
@@ -300,6 +304,181 @@ def test_daily_cycle_skips_paperclip_dispatch_when_all_concrete_agents_are_in_co
     assert len(result.created_issue_numbers) == 1
     assert paperclip.created == []  # never dispatched with no free agent
     assert task.id not in result.paperclip_created_task_ids
+    assert task.id in result.dispatch_incomplete_task_ids
+
+
+def test_daily_cycle_never_dispatches_unpreferenced_task_when_both_agents_are_in_cooldown(store):
+    # Review Task #131 round 2, finding #1: a task naming NO concrete
+    # preference (EITHER/NONE) previously skipped the availability check
+    # entirely and dispatched with assignee=None even with both agents
+    # limited - it must now be held back exactly like a concretely
+    # preferenced task would be.
+    task = _task(title="No preference at all", state=TaskState.READY)
+    store.save_task(task)
+    mark_rate_limited(store, AgentName.CLAUDE, "quota")
+    mark_rate_limited(store, AgentName.CODEX, "quota")
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    result = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert paperclip.created == []
+    assert task.id in result.dispatch_incomplete_task_ids
+
+
+def test_daily_cycle_never_uses_a_cross_company_agent_match(store, monkeypatch):
+    # Review Task #131 round 2, finding #2: find_agent must be scoped to
+    # THIS company - a same-named agent belonging to a different company
+    # must never be trusted.
+    def cross_company_find_agent(name_query, *, company_id=None, base_url=None, timeout=None):
+        return {"id": "agent-from-other-company", "_company_id": "other-company"}, None
+
+    monkeypatch.setattr("paperclip_client.find_agent", cross_company_find_agent)
+
+    task = _task(title="Needs same-company agent", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, agent_class=AgentClass.CLAUDE)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    result = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert paperclip.created == []  # never dispatched with an unscoped/rejected identity
+    assert task.id in result.dispatch_incomplete_task_ids
+
+
+def test_daily_cycle_reuses_existing_assignment_instead_of_conflicting_on_retry(store, monkeypatch):
+    # Review Task #131 round 2, finding #3: re-running dispatch after the
+    # originally-assigned agent goes into cooldown must NOT try a
+    # different assignee for the same correlation_id (#18's fingerprint
+    # would reject that as a conflict) - the existing assignment is
+    # reused, and the task stays correctly assigned. Uses the REAL
+    # PaperclipSession/create_task_idempotent (against a faked HTTP
+    # transport, like test_paperclip_ops.py) rather than the hand-rolled
+    # FakePaperclipSession, since get_existing_assignment reads the real
+    # persisted paperclip_creations table that only #18's own code writes.
+    class Response:
+        def __init__(self, payload, status=200):
+            self.payload, self.status_code, self.text = payload, status, "response"
+
+        def json(self):
+            return self.payload
+
+    class Transport:
+        def __init__(self):
+            self.tasks = []
+
+        def get(self, url, **kwargs):
+            return Response(list(self.tasks))
+
+        def post(self, url, **kwargs):
+            created = {"id": f"pc-{len(self.tasks) + 1}", "status": "backlog", **kwargs["json"]}
+            self.tasks.append(created)
+            return Response(created, 201)
+
+    transport = Transport()
+    monkeypatch.setattr(pc.requests, "get", transport.get)
+    monkeypatch.setattr(pc.requests, "post", transport.post)
+    monkeypatch.setattr(pc, "_CONFIG_TOKEN", "")
+    monkeypatch.delenv("PAPERCLIP_API_TOKEN", raising=False)
+
+    task = _task(title="Reassigned by mistake?", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, fallback_agent=AgentName.CODEX,
+                agent_class=AgentClass.CLAUDE)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = PaperclipSession(config=OrchestratorConfig(paperclip_base_url="http://paperclip.invalid"))
+
+    first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                            company_id="acme", clock=clock)
+    assert task.id in first.assigned_task_ids
+    assert transport.tasks[-1]["assigneeAgentId"] == "agent-claude"
+
+    mark_rate_limited(store, AgentName.CLAUDE, "quota")  # now Claude is in cooldown
+
+    second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert task.id in second.assigned_task_ids
+    assert task.id not in second.dispatch_incomplete_task_ids
+    assert len(transport.tasks) == 1  # no second POST at all - existing assignment reused
+    assert transport.tasks[-1]["assigneeAgentId"] == "agent-claude"  # SAME id, never agent-codex
+
+
+def test_daily_cycle_reassigns_reviewer_when_it_collides_with_the_resolved_implementer(store):
+    # Review Task #131 round 2, finding #1: the resolved implementer must
+    # never equal the task's own reviewer_preference (#24/#29).
+    task = _task(title="Self-review risk", state=TaskState.READY,
+                preferred_agent=AgentName.CLAUDE, agent_class=AgentClass.CLAUDE,
+                reviewer_preference=AgentName.CLAUDE)
+    store.save_task(task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                    company_id="acme", clock=clock)
+
+    assert store.get_task(task.id).reviewer_preference == AgentName.CODEX
+
+
+def test_daily_cycle_reconsiders_next_cycle_task_once_its_dependency_finishes_same_day(store):
+    # Review Task #131 round 2, finding #4: a NEXT_CYCLE task whose
+    # dependency finishes AFTER on_cycle_start's own once-per-day scan
+    # must still be reconsidered within the SAME call/day.
+    clock = Clock(datetime(2026, 9, 13, 8, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+
+    dependency = _task(title="Dependency", state=TaskState.IN_PROGRESS)
+    store.save_task(dependency)
+    child = _task(title="Waiting child", state=TaskState.NEXT_CYCLE, dependencies=[dependency.id])
+    store.save_task(child)
+
+    first = run_daily_cycle(store, PROJECT, client=client, clock=clock)
+    assert child.id not in first.ready_task_ids
+    assert store.get_task(child.id).state == TaskState.NEXT_CYCLE
+
+    dependency.state = TaskState.DONE
+    store.save_task(dependency)
+    clock.advance(hours=1)  # still within the admission window
+
+    second = run_daily_cycle(store, PROJECT, client=client, clock=clock)
+
+    assert child.id in second.promoted_task_ids
+    assert child.id in second.ready_task_ids
+    assert store.get_task(child.id).state == TaskState.READY
+
+
+def test_daily_cycle_promoted_task_ids_is_stable_under_a_fixed_clock(store):
+    # Review Task #131 round 2, finding #5: deriving promoted_task_ids
+    # from an event-timestamp query broke when two calls share the exact
+    # same instant (a fixed/rolled-back clock) - the second call must
+    # never re-report the first call's own promotions.
+    task = _task(title="Promoted once", state=TaskState.NEXT_CYCLE)
+    store.save_task(task)
+    clock = Clock(datetime(2026, 9, 13, 8, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+
+    first = run_daily_cycle(store, PROJECT, client=client, clock=clock)
+    second = run_daily_cycle(store, PROJECT, client=client, clock=clock)  # same instant, no advance
+
+    assert task.id in first.promoted_task_ids
+    assert task.id not in second.promoted_task_ids
 
 
 def test_daily_cycle_reports_dispatch_incomplete_when_assignment_is_not_confirmed(store):

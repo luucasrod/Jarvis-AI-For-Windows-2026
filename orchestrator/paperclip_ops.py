@@ -230,6 +230,44 @@ def create_task_idempotent(
             store.close()
 
 
+def get_existing_assignment(
+    company_id: str, correlation_id: str, *, store: Store, config: OrchestratorConfig | None = None,
+) -> str | None:
+    """Returns the `assignee_agent_id` already committed for this (server,
+    company, correlation_id) creation, if a result was ever recorded -
+    `None` when nothing was created yet (or the local record is missing/
+    unreadable, treated the same as "not yet created").
+
+    A caller planning to call `create_task_idempotent` again for a task
+    it already dispatched MUST reuse this exact id rather than
+    re-resolving a fresh one: the fingerprint that call's own dedup keys
+    on already includes `assignee_agent_id` (see `create_task_idempotent`),
+    so passing a DIFFERENT one on a later call - e.g. because the
+    originally-assigned agent went into cooldown by the next cycle - is a
+    `correlation_conflict`, not a reassignment (#30, Review Task #131
+    round 2, finding #3). Reassigning an existing remote task to a
+    different agent is a distinct, explicit operation this module does
+    not perform.
+    """
+    cfg = config or load_config()
+    key = _digest([cfg.paperclip_base_url.rstrip('/'), company_id, correlation_id])
+    try:
+        store.ensure_schema(_SCHEMA)
+        rows = store.query('SELECT result FROM paperclip_creations WHERE operation_key = ?', (key,))
+    except sqlite3.Error:
+        return None
+    if not rows or rows[0][0] is None:
+        return None
+    try:
+        remote = json.loads(rows[0][0])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(remote, dict):
+        return None
+    agent_id = remote.get('assigneeAgentId')
+    return agent_id if isinstance(agent_id, str) and agent_id else None
+
+
 def get_task_status(company_id: str, task_id: str, *, config: OrchestratorConfig | None = None) -> dict:
     """Read an exact task ID through the company-scoped list endpoint."""
     if not all(isinstance(value, str) and value.strip() for value in (company_id, task_id)):
