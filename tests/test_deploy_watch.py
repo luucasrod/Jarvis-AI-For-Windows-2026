@@ -466,41 +466,168 @@ def test_repeated_calls_with_different_commit_and_logs_replay_the_same_issue_pay
 
 
 def test_pre_existing_legacy_task_from_before_the_episode_table_is_adopted_not_duplicated(store):
-    # Finding #4: #142's original scheme used the bare
+    # Round-3 finding #4 redux: #142's original scheme used the bare
     # sha256([project, kind, detail]) hash as correlation_id directly, with
-    # no episodes table at all. A database upgraded from that version must
-    # ADOPT the existing open Task/Issue for a still-failing signature,
-    # never mint a second Task/Issue for it.
+    # no episodes table at all - and by the time this code runs, its OWN
+    # detail-text formatting has already changed (round 2's naive re-hash
+    # of the CURRENT wording never matches the legacy correlation_id at
+    # all). Migration must match structurally (open post_deploy_check
+    # Task for this project, not yet linked to an episode row), not by
+    # recomputing a hash from today's wording.
     github = _FakeGitHub()
     client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
-    strategy = DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example")
-    result = run_smoke_check(_project(), strategy, get_fn=lambda url, timeout: _Response(502))
 
-    from orchestrator.deploy_watch import _detail_hash
-    legacy_correlation_id = _detail_hash(_project(), result)
+    # Simulate #142's own pre-episode-table code: a Task with a bare-hash
+    # correlation_id, and its Issue created for real through GitHubClient
+    # - exactly as #142 itself would have done, with #142's own wording.
     legacy_task = Task(
-        title=f"[smoke check] hub: {result.detail}", objective=result.detail,
-        project_id="hub", origin="post_deploy_check", state=TaskState.BUG_FOUND,
-        correlation_id=legacy_correlation_id,
+        title="[smoke check] hub: URL respondeu com erro de servidor",
+        objective="URL respondeu com erro de servidor", project_id="hub",
+        origin="post_deploy_check", state=TaskState.BUG_FOUND,
     )
     store.save_task(legacy_task)
-    # Simulate the Issue #142 already created for this legacy correlation.
-    github.run(
-        ["gh", "api", "--method", "POST", "repos/owner/repo/issues"],
-        input=json.dumps({
-            "repo": "owner/repo", "title": legacy_task.title, "body": "corpo legado original",
-            "labels": ["origin:post_deploy_check"], "correlation_id": legacy_correlation_id,
-        }),
+    client.create_issue(
+        "owner/repo", legacy_task.title, "corpo legado original",
+        ["origin:post_deploy_check"], legacy_task.correlation_id,
     )
-    github.posts.clear()  # only tracking posts made THROUGH report_smoke_check_failure from here
+    assert len(github.posts) == 1
+
+    # The SAME real failure recurs, but today's run_smoke_check produces
+    # different wording/hash for it than #142's version did.
+    strategy = DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example")
+    result = run_smoke_check(_project(), strategy, get_fn=lambda url, timeout: _Response(502))
 
     report = report_smoke_check_failure(_project(), result, store, client=client)
 
     assert report.task.id == legacy_task.id
-    assert report.task.correlation_id == legacy_correlation_id
+    assert report.task.correlation_id == legacy_task.correlation_id
+    assert report.is_new_episode is False
     assert len(store.list_tasks(state=TaskState.BUG_FOUND)) == 1  # no second Task minted
-    assert len(github.issues) == 1  # no second Issue created
+    assert len(github.posts) == 1  # replayed the original payload verbatim, no new POST
+    assert github.posts[0]["body"].startswith("corpo legado original")
+    assert report.issue_available is True  # not correlation_conflict
 
     second = report_smoke_check_failure(_project(), result, store, client=client)
     assert second.task.id == legacy_task.id
-    assert len(github.issues) == 1
+    assert len(github.posts) == 1
+
+
+def test_adopting_a_legacy_emergency_task_with_an_unanswered_page_does_not_page_again(store, monkeypatch):
+    # Round-3 finding #3: #142's own notify_needs_lucas wording has also
+    # changed since - a fresh page under new wording would not be
+    # recognized as the same question by decisions.py's content-keyed
+    # dedup, producing a second confirmed page for one real, STILL-UNANSWERED
+    # episode. Adoption must not page again while the original question is
+    # still outstanding.
+    sent = []
+    monkeypatch.setattr(
+        "orchestrator.decisions.send_control_message",
+        lambda message, **k: (sent.append(message), (True, None))[1],
+    )
+    github = _FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+
+    legacy_task = Task(
+        title="[smoke check] hub: alvo inalcancavel", objective="alvo inalcancavel",
+        project_id="hub", origin="post_deploy_check", state=TaskState.NEEDS_LUCAS,
+    )
+    store.save_task(legacy_task)
+    client.create_issue(
+        "owner/repo", legacy_task.title, "corpo legado original",
+        ["origin:post_deploy_check"], legacy_task.correlation_id,
+    )
+    # Represents #142's own original (unresolved) page for this Task.
+    store.save_decision(
+        correlation_id=f"{legacy_task.correlation_id}:legacy", task_id=legacy_task.id,
+        message="pergunta legada original",
+    )
+
+    def get_fn(url, timeout):
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    result = run_smoke_check(
+        _project(), DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example"),
+        get_fn=get_fn,
+    )
+    report = report_smoke_check_failure(_project(), result, store, client=client)
+
+    assert report.task.id == legacy_task.id
+    assert report.notified is False
+    assert sent == []
+    assert len(store.get_pending_decisions()) == 1  # still only the original
+
+
+def test_adopting_a_legacy_task_whose_old_decision_was_already_answered_still_pages_for_a_new_emergency(store, monkeypatch):
+    # Independent-review finding: matching legacy Tasks by project_id alone
+    # (kind/detail aren't recoverable from an old Task) means an adopted
+    # Task might be an UNRELATED, already-resolved old incident - a
+    # genuinely new "production is down" emergency must still page Lucas,
+    # never silently swallowed just because some old Task got adopted.
+    sent = []
+    monkeypatch.setattr(
+        "orchestrator.decisions.send_control_message",
+        lambda message, **k: (sent.append(message), (True, None))[1],
+    )
+    github = _FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+
+    legacy_task = Task(
+        title="[smoke check] hub: velho e ja resolvido", objective="velho e ja resolvido",
+        project_id="hub", origin="post_deploy_check", state=TaskState.NEEDS_LUCAS,
+    )
+    store.save_task(legacy_task)
+    client.create_issue(
+        "owner/repo", legacy_task.title, "corpo legado antigo",
+        ["origin:post_deploy_check"], legacy_task.correlation_id,
+    )
+    store.save_decision(
+        correlation_id=f"{legacy_task.correlation_id}:legacy", task_id=legacy_task.id,
+        message="pergunta legada ja respondida",
+    )
+    store.resolve_decision(f"{legacy_task.correlation_id}:legacy", "ja resolvido ha meses")
+
+    def get_fn(url, timeout):
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    result = run_smoke_check(
+        _project(), DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example"),
+        get_fn=get_fn,
+    )
+    report = report_smoke_check_failure(_project(), result, store, client=client)
+
+    assert report.task.id == legacy_task.id  # identity reuse still happened
+    assert report.notified is True  # but the NEW emergency still got paged
+    assert len(sent) == 1
+
+
+def test_resolving_an_adopted_legacy_episode_is_not_undone_by_re_adoption(store):
+    # Round-3 finding #4: resolve_episode() on an adopted row used to be
+    # silently ignored - the next call re-ran the SAME structural legacy
+    # lookup, found the still-BUG_FOUND legacy Task again, and re-adopted
+    # it under the same identity, undoing the resolution. Once adopted, a
+    # legacy task_id must never be discoverable as "unmigrated" again.
+    github = _FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+
+    legacy_task = Task(
+        title="[smoke check] hub: URL respondeu com erro de servidor",
+        objective="URL respondeu com erro de servidor", project_id="hub",
+        origin="post_deploy_check", state=TaskState.BUG_FOUND,
+    )
+    store.save_task(legacy_task)
+    client.create_issue(
+        "owner/repo", legacy_task.title, "corpo legado original",
+        ["origin:post_deploy_check"], legacy_task.correlation_id,
+    )
+
+    strategy = DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example")
+    result = run_smoke_check(_project(), strategy, get_fn=lambda url, timeout: _Response(502))
+
+    first = report_smoke_check_failure(_project(), result, store, client=client)
+    assert first.task.id == legacy_task.id
+
+    resolve_episode(store, _project(), result.kind, result.detail)
+    second = report_smoke_check_failure(_project(), result, store, client=client)
+
+    assert second.task.id != legacy_task.id  # a genuinely new episode, not the resolved legacy one
+    assert second.is_new_episode is True

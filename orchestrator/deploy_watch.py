@@ -273,7 +273,7 @@ def _detail_hash(project_context, result: SmokeCheckResult) -> str:
 
 def _reserve_episode(
     store: Store, project_id: str, kind: str, detail_hash: str, task: Task,
-    issue_title: str, issue_body: str,
+    issue_title: str, issue_body: str, repo: str | None,
 ) -> tuple[str, Task, bool, str, str]:
     """Atomically reserves the identity for this failure EPISODE - the
     first and only place a Task gets minted for it, and the only place
@@ -308,23 +308,71 @@ def _reserve_episode(
     they never track a later call's own commit/logs.
 
     Finding #4 (adopting a pre-existing Task from before this table
-    existed): #142's original scheme used the bare
-    sha256([project, kind, detail]) hash itself as `correlation_id`, with
-    no separate identity table - `detail_hash` here uses the exact same
-    formula, so it doubles as that legacy correlation_id. Before minting
-    a brand new episode, an open (non-DONE/FAILED) legacy Task with that
-    exact correlation_id and origin='post_deploy_check' is adopted into
-    the episodes table instead - same task_id, same correlation_id - so
-    GitHubClient's own dedup (keyed on repo+correlation_id) finds the
-    Issue it already created instead of posting a second one.
+    existed) - reworked in round 3 after Codex's round-3 review found the
+    round-2 attempt broken four separate ways:
+
+    #142's original scheme used the bare sha256([project, kind, detail])
+    hash as `correlation_id`, with no separate identity table. Round 2
+    tried to re-derive that SAME hash from the CURRENT call's `detail`
+    text to find the legacy Task - but `detail`'s wording has already
+    changed since #142 shipped (e.g. "erro de servidor" became "status
+    inesperado (502)"), so the freshly computed hash never again equals
+    the legacy correlation_id: the legacy Task was never found at all,
+    and every other round-2 fix (payload replay, atomic BUG_FOUND) never
+    got exercised for it, producing a genuine second Task/Issue and, for
+    an emergency, a second Lucas page.
+
+    A migration can never assume its own current text formatting matches
+    whatever an OLDER version of this same function once produced - free
+    text is exactly the wrong thing to key an identity match on across
+    releases. Legacy adoption below matches structurally instead: ANY
+    still-open (`state` not DONE/FAILED) Task with `origin` =
+    'post_deploy_check' for this `project_id` that is not YET referenced
+    by any row in `deploy_failure_episodes` is treated as pre-dating this
+    table (a project realistically has one deploy target at a time, so
+    project_id alone is enough - `kind`/`detail_hash` are not recoverable
+    from a legacy Task's own fields). Once adopted, its task_id is
+    referenced by an episode row FOREVER (even after that row is later
+    marked `resolved`), so it can never be re-discovered as "still
+    unmigrated" and re-adopted into a fresh episode_id later - closing
+    finding #4's specific reopen-loop bug where `resolve_episode` kept
+    getting silently undone.
+
+    Adoption never re-derives the Issue payload from today's
+    `_format_bug_body` (finding #1: the recomputed body doesn't match
+    what GitHubClient already has on file for that correlation_id, and
+    it refuses `correlation_conflict` on any mismatch). It looks up
+    GitHubClient's OWN durable operation payload directly (same Store,
+    `pending_github_ops`, keyed by sha256(repo\0correlation_id) exactly
+    as GitHubClient computes it) and replays that verbatim; only when no
+    such record exists does it fall back to the caller's freshly
+    computed title/body (accepting, at worst, one non-destructive
+    `correlation_conflict` on replay - never a duplicate).
+
+    Adoption never emits BUG_FOUND (that stays gated on `is_new_episode`,
+    which adoption always returns False for - it is only a low-stakes
+    internal audit event, not worth duplicating on every adopted call).
+    Lucas notification (finding #3: the static wording in
+    `notify_needs_lucas`'s call also changed since #142, so decisions.py's
+    content-keyed dedup no longer recognizes a freshly-worded page as the
+    same question) is NOT gated on `is_new_episode` here - see
+    `report_smoke_check_failure`'s own gate, which pages whenever this
+    task has no ACTIVE unresolved decision yet, adopted or not. An
+    adopted Task whose original page is still outstanding is not paged
+    again; one whose page was already answered (or that never had one -
+    e.g. an unrelated stale Task) still gets paged for a genuinely
+    present emergency, since this module cannot tell "the same old
+    incident, reworded" apart from "an unrelated Task that happened to
+    match by project_id alone", and silently dropping a real page is far
+    worse than one avoidable extra one.
 
     A resolved episode's identity never lives forever: `episode_id` (a
     fresh uuid4) is only minted when no row exists yet OR the existing
-    one is `resolved` - the caller's correlation_id for a NEW episode is
-    built FROM this episode_id, so a genuinely new episode always gets a
-    genuinely new GitHub correlation, while a still-open one (including
-    an adopted legacy one, which keeps ITS OWN original correlation_id)
-    keeps reusing the same one.
+    one is `resolved` - the caller's correlation_id for a genuinely NEW
+    episode is built FROM this episode_id, so it always gets a genuinely
+    new GitHub correlation, while a still-open one (including an adopted
+    legacy one, which keeps ITS OWN original correlation_id) keeps
+    reusing the same one.
     """
     def apply(connection):
         row = connection.execute(
@@ -341,12 +389,25 @@ def _reserve_episode(
 
         legacy = connection.execute(
             "SELECT id, data FROM tasks WHERE state NOT IN (?, ?) "
-            "AND json_extract(data, '$.correlation_id') = ? "
-            "AND json_extract(data, '$.origin') = 'post_deploy_check'",
-            (*_CLOSED_TASK_STATES, detail_hash),
+            "AND json_extract(data, '$.origin') = 'post_deploy_check' "
+            "AND json_extract(data, '$.project_id') = ? "
+            "AND id NOT IN (SELECT task_id FROM deploy_failure_episodes)",
+            (*_CLOSED_TASK_STATES, project_id),
         ).fetchone()
         if legacy is not None:
             legacy_task = Task.from_dict(json.loads(legacy[1]))
+            adopted_title, adopted_body = legacy_task.title, issue_body
+            if repo:
+                op_key = hashlib.sha256(
+                    f"{repo.lower()}\0{legacy_task.correlation_id}".encode("utf-8"),
+                ).hexdigest()
+                original = connection.execute(
+                    "SELECT payload FROM pending_github_ops WHERE operation_key = ?", (op_key,),
+                ).fetchone()
+                if original is not None:
+                    original_payload = json.loads(original[0])
+                    adopted_title = original_payload.get("title", adopted_title)
+                    adopted_body = original_payload.get("body", adopted_body)
             connection.execute(
                 "INSERT INTO deploy_failure_episodes "
                 "(project_id, kind, detail_hash, episode_id, task_id, resolved, issue_title, issue_body) "
@@ -354,14 +415,11 @@ def _reserve_episode(
                 "ON CONFLICT(project_id, kind, detail_hash) DO UPDATE SET "
                 "episode_id = excluded.episode_id, task_id = excluded.task_id, resolved = 0, "
                 "issue_title = excluded.issue_title, issue_body = excluded.issue_body",
-                (project_id, kind, detail_hash, detail_hash, legacy_task.id, legacy_task.title, issue_body),
+                (project_id, kind, detail_hash, legacy_task.correlation_id, legacy_task.id,
+                 adopted_title, adopted_body),
             )
-            emit_in_transaction(
-                connection, EventType.BUG_FOUND,
-                {"task_id": legacy_task.id, "project": project_id, "kind": kind, "migrated": True},
-                correlation_id=legacy_task.correlation_id, project_id=project_id,
-            )
-            return detail_hash, legacy_task, True, legacy_task.title, issue_body
+            # Never emit BUG_FOUND / notify here - see finding #3 above.
+            return legacy_task.correlation_id, legacy_task, False, adopted_title, adopted_body
 
         episode_id = str(uuid.uuid4())
         # A short episode suffix keeps a reopened episode's title distinct
@@ -475,6 +533,7 @@ def report_smoke_check_failure(
     )
     episode_id, task, is_new_episode, issue_title, issue_body = _reserve_episode(
         store, project_context.canonical_id, kind, detail_hash, placeholder, title, body,
+        project_context.repository,
     )
 
     issue_available: bool | None = None
@@ -488,8 +547,22 @@ def report_smoke_check_failure(
         issue_available = bool(issue_result.get("available"))
         issue_reason = issue_result.get("reason")
 
+    # Pages Lucas only when this task has no ACTIVE unresolved decision yet
+    # (round 3, revised after independent review flagged the earlier
+    # `is_new_episode`-only gate): an adopted legacy Task was already
+    # notified once under #142's own wording, which this module cannot
+    # reproduce verbatim, so decisions.py's content-keyed dedup would not
+    # recognize a freshly-worded page as the same question and would send
+    # a second one (finding #3) - checking for an existing UNRESOLVED
+    # decision on this task_id sidesteps that without depending on exact
+    # wording. Critically, this does NOT gate on `is_new_episode`: an
+    # adopted legacy Task whose original decision was already answered (or
+    # that never actually had one) still gets paged for a genuine present
+    # emergency - silently dropping a real "production is down" page
+    # because SOME unrelated old Task happened to get adopted would be far
+    # worse than one avoidable duplicate.
     notified = False
-    if result.emergency:
+    if result.emergency and not any(d["task_id"] == task.id for d in store.get_pending_decisions()):
         ok, _error = notify_needs_lucas(
             task,
             problem=f"{project_context.canonical_id} pode estar fora do ar apos o deploy.",
