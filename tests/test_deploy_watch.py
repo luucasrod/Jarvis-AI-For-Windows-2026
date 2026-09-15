@@ -14,7 +14,7 @@ from orchestrator.deploy_watch import (
 )
 from orchestrator.events import EventType, query_events
 from orchestrator.github_client import GitHubClient
-from orchestrator.models import TaskState
+from orchestrator.models import Task, TaskState
 from orchestrator.persistence import Store
 from orchestrator.project_resolver import ProjectContext
 
@@ -388,3 +388,119 @@ def test_bug_body_never_contains_raw_exception_text():
     body = _format_bug_body(_project(), result, commit="abc123", logs=None)
     assert "SENTINEL_LEAK" not in body
     assert "abc123" in body
+
+
+# --- round-2 fixes (Review Task #143, round-2 findings) ---------------------
+
+def test_structured_trigger_canonical_auto_on_push_is_recognized():
+    # Finding #5: the index may already store the canonical trigger value
+    # itself ("auto_on_push"), not just a freeform sentence containing an
+    # auto-deploy marker word.
+    project = _project(deploy={"production_url": "https://x.example", "trigger": "auto_on_push"})
+    assert get_deploy_strategy(project).trigger == "auto_on_push"
+
+
+def test_production_url_credentials_and_query_never_reach_detail_or_evidence():
+    # Finding #3: a leaked password/token in the URL must never reach any
+    # persisted/published text - only scheme+host+path are safe.
+    strategy = DeployStrategy(
+        kind="web", trigger="auto_on_push",
+        production_url="https://user:PASSWORD_SENTINEL@test.invalid/health?token=QUERY_SENTINEL",
+    )
+    result = run_smoke_check(_project(), strategy, get_fn=lambda url, timeout: _Response(503))
+    assert "PASSWORD_SENTINEL" not in result.detail
+    assert "QUERY_SENTINEL" not in result.detail
+    assert "test.invalid/health" in result.detail
+
+    from orchestrator.deploy_watch import _format_bug_body
+    body = _format_bug_body(_project(), result, commit=None, logs=None)
+    assert "PASSWORD_SENTINEL" not in body
+    assert "QUERY_SENTINEL" not in body
+
+
+def test_bug_found_event_is_committed_atomically_with_the_task_reservation(store):
+    # Finding #1: BUG_FOUND must land in the SAME transaction that creates
+    # the Task/episode row - simulated here by making the GitHub call
+    # (which happens AFTER _reserve_episode returns) blow up, and checking
+    # the event still exists despite the caller never getting a result.
+    class _ExplodingClient:
+        def create_issue(self, *a, **k):
+            raise RuntimeError("simulated crash during publish")
+
+    result = run_smoke_check(
+        _project(), DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example"),
+        get_fn=lambda url, timeout: _Response(502),
+    )
+    with pytest.raises(RuntimeError):
+        report_smoke_check_failure(_project(), result, store, client=_ExplodingClient())
+
+    events = query_events(store, event_types=[EventType.BUG_FOUND])
+    assert len(events) == 1
+
+
+def test_repeated_calls_with_different_commit_and_logs_replay_the_same_issue_payload(store):
+    # Finding #2: GitHubClient's own idempotency compares the FULL payload
+    # (title+body+labels+correlation_id) for a correlation_id and refuses
+    # ('correlation_conflict') on any mismatch - so a second call with
+    # different commit/logs for the SAME open episode must replay the
+    # original payload verbatim, not recompute a different one.
+    github = _FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+    result = run_smoke_check(
+        _project(), DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example"),
+        get_fn=lambda url, timeout: _Response(502),
+    )
+
+    first = report_smoke_check_failure(
+        _project(), result, store, client=client, commit="commit-one", logs="first attempt logs",
+    )
+    second = report_smoke_check_failure(
+        _project(), result, store, client=client, commit="commit-two", logs="second attempt logs",
+    )
+
+    assert len(github.posts) == 1
+    assert first.issue_available is True
+    assert second.issue_available is True
+    assert second.issue_reason is None  # never 'correlation_conflict'
+    assert "commit-two" not in github.posts[0]["body"]
+
+
+def test_pre_existing_legacy_task_from_before_the_episode_table_is_adopted_not_duplicated(store):
+    # Finding #4: #142's original scheme used the bare
+    # sha256([project, kind, detail]) hash as correlation_id directly, with
+    # no episodes table at all. A database upgraded from that version must
+    # ADOPT the existing open Task/Issue for a still-failing signature,
+    # never mint a second Task/Issue for it.
+    github = _FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+    strategy = DeployStrategy(kind="web", trigger="auto_on_push", production_url="https://x.example")
+    result = run_smoke_check(_project(), strategy, get_fn=lambda url, timeout: _Response(502))
+
+    from orchestrator.deploy_watch import _detail_hash
+    legacy_correlation_id = _detail_hash(_project(), result)
+    legacy_task = Task(
+        title=f"[smoke check] hub: {result.detail}", objective=result.detail,
+        project_id="hub", origin="post_deploy_check", state=TaskState.BUG_FOUND,
+        correlation_id=legacy_correlation_id,
+    )
+    store.save_task(legacy_task)
+    # Simulate the Issue #142 already created for this legacy correlation.
+    github.run(
+        ["gh", "api", "--method", "POST", "repos/owner/repo/issues"],
+        input=json.dumps({
+            "repo": "owner/repo", "title": legacy_task.title, "body": "corpo legado original",
+            "labels": ["origin:post_deploy_check"], "correlation_id": legacy_correlation_id,
+        }),
+    )
+    github.posts.clear()  # only tracking posts made THROUGH report_smoke_check_failure from here
+
+    report = report_smoke_check_failure(_project(), result, store, client=client)
+
+    assert report.task.id == legacy_task.id
+    assert report.task.correlation_id == legacy_correlation_id
+    assert len(store.list_tasks(state=TaskState.BUG_FOUND)) == 1  # no second Task minted
+    assert len(github.issues) == 1  # no second Issue created
+
+    second = report_smoke_check_failure(_project(), result, store, client=client)
+    assert second.task.id == legacy_task.id
+    assert len(github.issues) == 1

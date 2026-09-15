@@ -13,11 +13,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 from orchestrator.decisions import notify_needs_lucas
-from orchestrator.events import EventType, emit
+from orchestrator.events import EventType, emit_in_transaction
 from orchestrator.github_client import GitHubClient
 from orchestrator.models import Task, TaskState
 from orchestrator.persistence import Store
@@ -26,11 +27,18 @@ _NOT_APPLICABLE_MARKERS = ("not applicable", "nao aplicavel", "n/a", "none")
 _UNRESOLVED_MARKER = "unresolved"
 _AUTO_TRIGGER_MARKERS = (
     "automatic", "automatico", "auto-deploy", "autodeploy", "auto deploy",
-    "ci/cd", "continuous deployment", "on push", "on every push",
+    "auto_on_push", "ci/cd", "continuous deployment", "on push", "on every push",
 )
 _MOBILE_COMMAND_KEYS = ("android", "ios")
 _VALID_KINDS = ("web", "api", "app")
+_CLOSED_TASK_STATES = (TaskState.DONE.value, TaskState.FAILED.value)
 
+# issue_title/issue_body persist the exact strings used for the episode's
+# GitHub Issue at creation/adoption time (round-2 finding #2): GitHubClient's
+# own idempotency compares the FULL payload for a given correlation_id and
+# refuses ('correlation_conflict') on any mismatch, so a later call for the
+# same still-open episode must replay these verbatim, never recompute them
+# from that call's own commit/logs.
 _EPISODE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS deploy_failure_episodes (
     project_id TEXT NOT NULL,
@@ -39,9 +47,29 @@ CREATE TABLE IF NOT EXISTS deploy_failure_episodes (
     episode_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0,
+    issue_title TEXT,
+    issue_body TEXT,
     PRIMARY KEY (project_id, kind, detail_hash)
 );
 """
+
+
+def _sanitize_url(url: str) -> str:
+    """Strips credentials and the query string before a production URL is
+    interpolated into any persisted/published text - round-2 finding #3:
+    `https://user:pass@host/health?token=SECRET` leaked the password and
+    token straight into the Task title, Issue title and Issue body. Only
+    scheme+host+path are safe to publish; the real URL (with credentials/
+    query intact) is used solely at the HTTP boundary in `run_smoke_check`'s
+    own `get(...)` call, never anywhere else."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "(url invalida)"
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _is_unset(text: str) -> bool:
@@ -198,17 +226,18 @@ def run_smoke_check(
                 expected="requisicao HTTP valida",
                 observed=_safe_observed(exc),
             )
+        safe_url = _sanitize_url(strategy.production_url)
         status = getattr(response, "status_code", None)
         if status is None or not is_ok_status(status):
             return SmokeCheckResult(
                 ok=False, kind=strategy.kind,
-                detail=f"{strategy.production_url} respondeu com status inesperado ({status})",
+                detail=f"{safe_url} respondeu com status inesperado ({status})",
                 expected="status HTTP aceito pelo criterio configurado",
                 observed=f"status {status}",
             )
         return SmokeCheckResult(
             ok=True, kind=strategy.kind,
-            detail=f"{strategy.production_url} respondeu {status}",
+            detail=f"{safe_url} respondeu {status}",
         )
 
     if strategy.kind == "app":
@@ -242,10 +271,17 @@ def _detail_hash(project_context, result: SmokeCheckResult) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _reserve_episode(store: Store, project_id: str, kind: str, detail_hash: str, task: Task) -> tuple[str, Task, bool]:
+def _reserve_episode(
+    store: Store, project_id: str, kind: str, detail_hash: str, task: Task,
+    issue_title: str, issue_body: str,
+) -> tuple[str, Task, bool, str, str]:
     """Atomically reserves the identity for this failure EPISODE - the
-    first and only place a Task gets minted for it - closing Review Task
-    #143 findings #1 and #2 together:
+    first and only place a Task gets minted for it, and the only place
+    BUG_FOUND is emitted for a new one - closing Review Task #143
+    findings #1, #2 and #4 together. Returns
+    (episode_id, task, is_new_episode, issue_title, issue_body) - the
+    last two are the strings the CALLER must send to GitHubClient
+    (possibly not the ones it passed in - see finding #2 below).
 
     Finding #1 (idempotency only at the GitHub layer): every call used to
     build a fresh Task with a random UUID, so two identical failures
@@ -255,23 +291,45 @@ def _reserve_episode(store: Store, project_id: str, kind: str, detail_hash: str,
     now always reuses the SAME task_id - reading the row fresh inside
     this transaction, never trusting a caller's own guess, the same
     cross-connection-safe pattern already used by #30's own dispatch
-    intent reservation.
+    intent reservation. BUG_FOUND is emitted with `emit_in_transaction`
+    in the SAME transaction that creates the Task/episode row (round-2
+    finding #1 - previously emitted after the transaction committed, so
+    a crash/interruption between the two left the event permanently
+    missing while the Task/Issue had already survived).
 
-    Finding #2 (a resolved episode's identity never expires): a
-    deterministic correlation_id derived purely from (project, kind,
-    detail) kept pointing at the OLD, already-closed Issue forever once
-    an episode resolved - the same failure recurring later silently
-    reused that confirmed-closed GitHub operation and never opened a new
-    Issue. `episode_id` (a fresh uuid4) is only minted when no row exists
-    yet OR the existing one is `resolved` - the caller's correlation_id
-    for GitHub is built FROM this episode_id, so a genuinely NEW episode
-    always gets a genuinely new GitHub correlation, while a still-open
-    one keeps reusing the same one.
+    Finding #2 (payload must never change within an open episode):
+    GitHubClient's own idempotency hashes the FULL create_issue payload
+    (title+body+labels+correlation_id) per correlation_id and returns
+    'correlation_conflict' on any mismatch - so recomputing the Issue
+    body from each call's own commit/logs broke replay for a still-open
+    episode. The title/body used for the WINNING reservation (new
+    episode or adopted legacy Task) are persisted on the episode row and
+    replayed verbatim on every later call for that same open episode;
+    they never track a later call's own commit/logs.
+
+    Finding #4 (adopting a pre-existing Task from before this table
+    existed): #142's original scheme used the bare
+    sha256([project, kind, detail]) hash itself as `correlation_id`, with
+    no separate identity table - `detail_hash` here uses the exact same
+    formula, so it doubles as that legacy correlation_id. Before minting
+    a brand new episode, an open (non-DONE/FAILED) legacy Task with that
+    exact correlation_id and origin='post_deploy_check' is adopted into
+    the episodes table instead - same task_id, same correlation_id - so
+    GitHubClient's own dedup (keyed on repo+correlation_id) finds the
+    Issue it already created instead of posting a second one.
+
+    A resolved episode's identity never lives forever: `episode_id` (a
+    fresh uuid4) is only minted when no row exists yet OR the existing
+    one is `resolved` - the caller's correlation_id for a NEW episode is
+    built FROM this episode_id, so a genuinely new episode always gets a
+    genuinely new GitHub correlation, while a still-open one (including
+    an adopted legacy one, which keeps ITS OWN original correlation_id)
+    keeps reusing the same one.
     """
     def apply(connection):
         row = connection.execute(
-            "SELECT episode_id, task_id, resolved FROM deploy_failure_episodes "
-            "WHERE project_id = ? AND kind = ? AND detail_hash = ?",
+            "SELECT episode_id, task_id, resolved, issue_title, issue_body "
+            "FROM deploy_failure_episodes WHERE project_id = ? AND kind = ? AND detail_hash = ?",
             (project_id, kind, detail_hash),
         ).fetchone()
         if row is not None and not row[2]:
@@ -279,7 +337,31 @@ def _reserve_episode(store: Store, project_id: str, kind: str, detail_hash: str,
                 "SELECT data FROM tasks WHERE id = ?", (row[1],),
             ).fetchone()
             if existing_task_row is not None:
-                return row[0], Task.from_dict(json.loads(existing_task_row[0])), False
+                return (row[0], Task.from_dict(json.loads(existing_task_row[0])), False, row[3], row[4])
+
+        legacy = connection.execute(
+            "SELECT id, data FROM tasks WHERE state NOT IN (?, ?) "
+            "AND json_extract(data, '$.correlation_id') = ? "
+            "AND json_extract(data, '$.origin') = 'post_deploy_check'",
+            (*_CLOSED_TASK_STATES, detail_hash),
+        ).fetchone()
+        if legacy is not None:
+            legacy_task = Task.from_dict(json.loads(legacy[1]))
+            connection.execute(
+                "INSERT INTO deploy_failure_episodes "
+                "(project_id, kind, detail_hash, episode_id, task_id, resolved, issue_title, issue_body) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
+                "ON CONFLICT(project_id, kind, detail_hash) DO UPDATE SET "
+                "episode_id = excluded.episode_id, task_id = excluded.task_id, resolved = 0, "
+                "issue_title = excluded.issue_title, issue_body = excluded.issue_body",
+                (project_id, kind, detail_hash, detail_hash, legacy_task.id, legacy_task.title, issue_body),
+            )
+            emit_in_transaction(
+                connection, EventType.BUG_FOUND,
+                {"task_id": legacy_task.id, "project": project_id, "kind": kind, "migrated": True},
+                correlation_id=legacy_task.correlation_id, project_id=project_id,
+            )
+            return detail_hash, legacy_task, True, legacy_task.title, issue_body
 
         episode_id = str(uuid.uuid4())
         # A short episode suffix keeps a reopened episode's title distinct
@@ -287,8 +369,9 @@ def _reserve_episode(store: Store, project_id: str, kind: str, detail_hash: str,
         # back to a case-insensitive TITLE match when a correlation marker
         # isn't found yet (e.g. a legacy issue), and two genuinely separate
         # episodes sharing an identical title would otherwise collide there.
+        titled = f"{task.title} [{episode_id[:8]}]"
         new_task = Task(
-            title=f"{task.title} [{episode_id[:8]}]", objective=task.objective,
+            title=titled, objective=task.objective,
             project_id=task.project_id, origin=task.origin, state=task.state,
             correlation_id=f"deploy-failure:{project_id}:{kind}:{detail_hash}:{episode_id}",
         )
@@ -298,13 +381,20 @@ def _reserve_episode(store: Store, project_id: str, kind: str, detail_hash: str,
             (new_task.id, new_task.state.value, json.dumps(new_task.to_dict())),
         )
         connection.execute(
-            "INSERT INTO deploy_failure_episodes (project_id, kind, detail_hash, episode_id, task_id, resolved) "
-            "VALUES (?, ?, ?, ?, ?, 0) "
+            "INSERT INTO deploy_failure_episodes "
+            "(project_id, kind, detail_hash, episode_id, task_id, resolved, issue_title, issue_body) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
             "ON CONFLICT(project_id, kind, detail_hash) DO UPDATE SET "
-            "episode_id = excluded.episode_id, task_id = excluded.task_id, resolved = 0",
-            (project_id, kind, detail_hash, episode_id, new_task.id),
+            "episode_id = excluded.episode_id, task_id = excluded.task_id, resolved = 0, "
+            "issue_title = excluded.issue_title, issue_body = excluded.issue_body",
+            (project_id, kind, detail_hash, episode_id, new_task.id, titled, issue_body),
         )
-        return episode_id, new_task, True
+        emit_in_transaction(
+            connection, EventType.BUG_FOUND,
+            {"task_id": new_task.id, "project": project_id, "kind": kind},
+            correlation_id=new_task.correlation_id, project_id=project_id,
+        )
+        return episode_id, new_task, True, titled, issue_body
 
     store.ensure_schema(_EPISODE_SCHEMA)
     return store.run_in_transaction(apply)
@@ -376,14 +466,15 @@ def report_smoke_check_failure(
     """
     kind = result.kind
     detail_hash = _detail_hash(project_context, result)
+    title = f"[smoke check] {project_context.canonical_id}: {result.detail}"
+    body = _format_bug_body(project_context, result, commit=commit, logs=logs)
     placeholder = Task(
-        title=f"[smoke check] {project_context.canonical_id}: {result.detail}",
-        objective=result.detail, project_id=project_context.canonical_id,
+        title=title, objective=result.detail, project_id=project_context.canonical_id,
         origin="post_deploy_check",
         state=TaskState.NEEDS_LUCAS if result.emergency else TaskState.BUG_FOUND,
     )
-    episode_id, task, is_new_episode = _reserve_episode(
-        store, project_context.canonical_id, kind, detail_hash, placeholder,
+    episode_id, task, is_new_episode, issue_title, issue_body = _reserve_episode(
+        store, project_context.canonical_id, kind, detail_hash, placeholder, title, body,
     )
 
     issue_available: bool | None = None
@@ -391,20 +482,11 @@ def report_smoke_check_failure(
     if project_context.repository:
         gh_client = client or GitHubClient(store)
         issue_result = gh_client.create_issue(
-            project_context.repository, task.title,
-            _format_bug_body(project_context, result, commit=commit, logs=logs),
+            project_context.repository, issue_title, issue_body,
             ["origin:post_deploy_check"], task.correlation_id,
         )
         issue_available = bool(issue_result.get("available"))
         issue_reason = issue_result.get("reason")
-
-    if is_new_episode:
-        emit(
-            store, EventType.BUG_FOUND,
-            {"task_id": task.id, "project": project_context.canonical_id, "kind": kind,
-             "emergency": result.emergency},
-            correlation_id=task.correlation_id, project_id=task.project_id,
-        )
 
     notified = False
     if result.emergency:
