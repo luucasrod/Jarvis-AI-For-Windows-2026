@@ -69,6 +69,31 @@ def test_send_invalid_token_returns_error_not_exception():
     assert "invalido" in error
 
 
+def test_send_and_poll_timeouts_come_from_config():
+    # Issue #44: these used to be hardcoded 10/15 constants regardless of
+    # config - now sourced from telegram_send_timeout_seconds /
+    # telegram_poll_timeout_seconds.
+    cfg = OrchestratorConfig(
+        telegram_bot_token="fake-token", telegram_control_chat_id="111", telegram_report_chat_id="222",
+        telegram_send_timeout_seconds=3, telegram_poll_timeout_seconds=44,
+    )
+    seen = {}
+
+    def fake_post(url, json, timeout):
+        seen["send"] = timeout
+        return _FakeResponse()
+
+    def fake_get(url, params, timeout):
+        seen["poll"] = timeout
+        return _FakeResponse(json_data={"ok": True, "result": []})
+
+    send_control_message("oi", config=cfg, post_fn=fake_post)
+    receive_control_updates(Store(":memory:"), config=cfg, get_fn=fake_get)
+
+    assert seen["send"] == 3
+    assert seen["poll"] == 44
+
+
 def test_send_network_timeout_handled_gracefully():
     import requests
 

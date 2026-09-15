@@ -57,6 +57,19 @@ def test_configured_but_unobserved_is_not_healthy(store):
     assert all(result.components[name].status == 'unknown' for name in ('jarvis', 'planner', 'scheduler'))
 
 
+def test_heartbeat_max_age_defaults_from_config_when_omitted(store):
+    # Issue #44: heartbeat_max_age_seconds/telegram_max_age_seconds used
+    # to be hardcoded 120/172800 constants regardless of config - a
+    # heartbeat old enough to be stale under a TIGHTER configured
+    # threshold, but that would still read as 'ok' under the old
+    # hardcoded 120s default, proves the config value is actually used.
+    for component in ('jarvis', 'planner', 'scheduler'):
+        health.record_heartbeat(store, component, at=NOW - timedelta(seconds=100))
+    tight_cfg = replace(CONFIG, heartbeat_max_age_seconds=50)
+    result = report(store, config=tight_cfg)
+    assert result.components['jarvis'].status == 'stale'
+
+
 def test_paperclip_offline_does_not_hide_other_components(store):
     seed_healthy(store)
     result = report(store, paperclip_probe=lambda: False)

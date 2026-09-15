@@ -62,6 +62,7 @@ from dataclasses import dataclass
 
 from orchestrator.audit import record as audit_record
 from orchestrator.audit import record_in_transaction as audit_record_in_transaction
+from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.events import EventType, emit_in_transaction, query_events
 from orchestrator.models import Task
 from orchestrator.persistence import Store
@@ -198,7 +199,8 @@ def try_auto_merge(
     expected_base: str,
     required_checks: list[str] | None = None,
     run_fn: Callable | None = None,
-    timeout: float = 30,
+    timeout: float | None = None,
+    config: OrchestratorConfig | None = None,
 ) -> MergeOutcome:
     """Merges `pr_number` into `expected_base` if review passed FOR
     `expected_head_sha` specifically, the PR's current head is exactly
@@ -210,6 +212,11 @@ def try_auto_merge(
     head sha) regardless of which call - or which of the two paths that
     can observe a completed merge - gets there first.
     """
+    # #44: default comes from config (GITHUB_TIMEOUT_SECONDS, shared with
+    # #17's own GitHubClient since both shell out to the same `gh` CLI)
+    # rather than a hardcoded constant - an explicit caller value still wins.
+    if timeout is None:
+        timeout = (config or load_config()).github_timeout_seconds
     run = run_fn or subprocess.run
     # Canonicalized ONCE here (consistent with #17's own GitHubClient._repo)
     # and used for every query/key/event/audit/CLI call below - #37 round 4

@@ -30,9 +30,13 @@ class PaperclipSession:
     """
 
     def __init__(self, *, config: OrchestratorConfig | None = None,
-                 clock=time.monotonic, max_backoff_seconds: float = 3600):
+                 clock=time.monotonic, max_backoff_seconds: float | None = None):
         self.config = config or load_config()
         base = self.config.retry_interval_seconds
+        # #44: default comes from config (PAPERCLIP_MAX_BACKOFF_SECONDS)
+        # rather than a hardcoded constant - explicit callers still win.
+        if max_backoff_seconds is None:
+            max_backoff_seconds = self.config.paperclip_max_backoff_seconds
         if (not math.isfinite(base) or base <= 0 or
                 not math.isfinite(max_backoff_seconds) or max_backoff_seconds < base):
             raise ValueError('backoff must be finite, positive, and capped at or above the base')

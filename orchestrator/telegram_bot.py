@@ -54,7 +54,7 @@ def _send_message(
         response = post(
             _url(config.telegram_bot_token, "sendMessage"),
             json={"chat_id": chat_id, "text": text},
-            timeout=10,
+            timeout=config.telegram_send_timeout_seconds,
         )
     except requests.exceptions.ConnectionError:
         return False, "offline"
@@ -141,7 +141,7 @@ def receive_control_updates(
         params["offset"] = last_update_id + 1
 
     try:
-        response = get(_url(config.telegram_bot_token, "getUpdates"), params=params, timeout=15)
+        response = get(_url(config.telegram_bot_token, "getUpdates"), params=params, timeout=config.telegram_poll_timeout_seconds)
     except Exception:
         return last_update_id
 
