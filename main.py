@@ -48,6 +48,17 @@ except ImportError:
     _wiz_devices_config: dict = {}
 
 import paperclip_client
+try:
+    import orchestrator.voice_facade as voice_facade
+except Exception:
+    # An orchestrator import/init failure must never abort Jarvis startup
+    # (Review Task #139, finding #3) - every call site below already
+    # treats `voice_facade` being falsy the same as a runtime facade
+    # error. Deliberately no exception detail logged here: this runs
+    # before `_log`'s own logging is configured, and a future real
+    # import could raise something carrying config/path details we don't
+    # want surfacing unfiltered.
+    voice_facade = None
 
 # ─── GERENCIAMENTO DE PROCESSO ────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1613,8 +1624,66 @@ def _looks_like_paperclip_query(q: str) -> bool:
     return any(p in q for p in _PAPERCLIP_TRIGGER_PHRASES)
 
 
+# New voice_facade intents (#11) - deliberately distinct phrases from
+# _PAPERCLIP_TRIGGER_PHRASES above so the two never shadow each other.
+_ORCHESTRATOR_STATUS_PHRASES = (
+    "status da orquestração", "status da orquestracao",
+    "status do orchestrator", "como está a orquestração", "como esta a orquestracao",
+)
+_ORCHESTRATOR_REPORT_PHRASES = (
+    "relatório da orquestração", "relatorio da orquestracao",
+    "relatório do orchestrator", "relatorio do orchestrator",
+)
+_ORCHESTRATOR_CONTROL_PHRASES = (
+    "pausar orquestração", "pausar orquestracao",
+    "pausar a orquestração", "pausar a orquestracao",
+    "retomar orquestração", "retomar orquestracao",
+    "retomar a orquestração", "retomar a orquestracao",
+    "controle da orquestração", "controle da orquestracao",
+)
+_ORCHESTRATOR_UNAVAILABLE = "A orquestração não está disponível agora, senhor."
+
+
 def process_command(query: str) -> bool:
     q = query.lower().strip()
+
+    # ── Orquestrador (status/relatório/controle) — facade em construção
+    # (#11). Checado ANTES do Paperclip: as novas frases são supersets de
+    # trechos de _PAPERCLIP_TRIGGER_PHRASES (ex.: "relatório da
+    # orquestração" contém "relatório") — na ordem antiga o Paperclip
+    # sempre vencia e nenhuma frase nova chegava ao facade (Review Task
+    # #139, achado #1). Uma vez que uma frase bateu aqui, o comando é
+    # CONSUMIDO: nunca cai adiante para um handler genérico de
+    # dispositivo/mídia/chat em caso de falha (achado #2) — qualquer
+    # exceção do facade, ou o próprio import ausente (achado #3, ver
+    # import no topo do arquivo), vira uma resposta segura de
+    # indisponibilidade, nunca autoriza outra ação nem derruba o Jarvis.
+    if any(p in q for p in _ORCHESTRATOR_STATUS_PHRASES):
+        try:
+            reply = voice_facade.handle_status_query(query) if voice_facade else None
+        except Exception as e:
+            _log(f"[ORCHESTRATOR] Erro no facade (status): {e}")
+            reply = None
+        say(reply or _ORCHESTRATOR_UNAVAILABLE)
+        return True
+
+    if any(p in q for p in _ORCHESTRATOR_REPORT_PHRASES):
+        try:
+            reply = voice_facade.handle_report_query() if voice_facade else None
+        except Exception as e:
+            _log(f"[ORCHESTRATOR] Erro no facade (relatório): {e}")
+            reply = None
+        say(reply or _ORCHESTRATOR_UNAVAILABLE)
+        return True
+
+    if any(p in q for p in _ORCHESTRATOR_CONTROL_PHRASES):
+        try:
+            reply = voice_facade.handle_control_query(query) if voice_facade else None
+        except Exception as e:
+            _log(f"[ORCHESTRATOR] Erro no facade (controle): {e}")
+            reply = None
+        say(reply or _ORCHESTRATOR_UNAVAILABLE)
+        return True
 
     # ── Paperclip (status dos agentes/projetos) — checa antes do resto pra não
     # cair em nenhum matcher genérico de "projeto"/"agente" ────────────────────
