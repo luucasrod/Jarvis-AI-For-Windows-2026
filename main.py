@@ -1636,7 +1636,9 @@ _ORCHESTRATOR_REPORT_PHRASES = (
 )
 _ORCHESTRATOR_CONTROL_PHRASES = (
     "pausar orquestração", "pausar orquestracao",
+    "pausar a orquestração", "pausar a orquestracao",
     "retomar orquestração", "retomar orquestracao",
+    "retomar a orquestração", "retomar a orquestracao",
     "controle da orquestração", "controle da orquestracao",
 )
 _ORCHESTRATOR_UNAVAILABLE = "A orquestração não está disponível agora, senhor."

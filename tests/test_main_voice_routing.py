@@ -153,6 +153,29 @@ def test_control_query_raising_never_falls_through_to_legacy_handler(calls):
     assert calls["say"] == ["A orquestração não está disponível agora, senhor."]
 
 
+def test_control_phrase_with_article_still_reaches_the_facade_not_media_pause(calls):
+    # Real manual-test regression (issue #11): a user naturally says
+    # "pausar A orquestração" - the article wasn't in the phrase list, so
+    # this fell through past all three orchestrator blocks and matched
+    # the legacy bare-"pausar" media-pause handler instead, reproducing
+    # Review Task #139's original finding #2 for this exact phrasing.
+    facade = _FakeFacade(control="Feito, senhor.")
+    result = _call("pausar a orquestração", facade, calls)
+
+    assert result is True
+    assert calls["media"] == []
+    assert calls["say"] == ["Feito, senhor."]
+
+
+def test_retomar_control_phrase_with_article_still_reaches_the_facade(calls):
+    facade = _FakeFacade(control="Feito, senhor.")
+    result = _call("retomar a orquestração", facade, calls)
+
+    assert result is True
+    assert calls["media"] == []
+    assert calls["say"] == ["Feito, senhor."]
+
+
 def test_missing_facade_reports_unavailable_without_raising(calls):
     # Review Task #139, finding #3: `voice_facade is None` (the import
     # failed) must behave exactly like a runtime facade error.

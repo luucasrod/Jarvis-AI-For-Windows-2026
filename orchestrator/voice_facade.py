@@ -12,8 +12,8 @@ change when that happens.
 from __future__ import annotations
 
 _NOT_IMPLEMENTED = (
-    "Isso ainda esta em construcao, senhor - a orquestracao completa do Jarvis "
-    "ainda nao esta ligada a voz."
+    "Isso ainda está em construção, senhor - a orquestração completa do Jarvis "
+    "ainda não está ligada à voz."
 )
 
 
