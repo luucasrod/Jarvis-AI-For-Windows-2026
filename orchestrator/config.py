@@ -22,6 +22,16 @@ _LOGGER = logging.getLogger(__name__)
 _DEFAULT_RETRY_INTERVAL_SECONDS = 30.0
 # Matches the existing Paperclip client's six-second request timeout.
 _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS = 6.0
+# #44 audit: these were hardcoded function-default constants scattered
+# across github_client.py, paperclip_ops.py, telegram_bot.py, healthcheck.py
+# and merge_policy.py with no way to tune them without editing code.
+_DEFAULT_GITHUB_TIMEOUT_SECONDS = 30.0
+_DEFAULT_GITHUB_MAX_BACKOFF_SECONDS = 3600.0
+_DEFAULT_PAPERCLIP_MAX_BACKOFF_SECONDS = 3600.0
+_DEFAULT_TELEGRAM_SEND_TIMEOUT_SECONDS = 10.0
+_DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 15.0
+_DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 120.0
+_DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS = 172800.0
 
 
 def _load_dotenv(path: Path) -> None:
@@ -88,6 +98,13 @@ class OrchestratorConfig:
     secondbrain_index_path: str = r"A:\SecondBrain\project_context_index.json"
     retry_interval_seconds: float = _DEFAULT_RETRY_INTERVAL_SECONDS
     paperclip_timeout_seconds: float = _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS
+    github_timeout_seconds: float = _DEFAULT_GITHUB_TIMEOUT_SECONDS
+    github_max_backoff_seconds: float = _DEFAULT_GITHUB_MAX_BACKOFF_SECONDS
+    paperclip_max_backoff_seconds: float = _DEFAULT_PAPERCLIP_MAX_BACKOFF_SECONDS
+    telegram_send_timeout_seconds: float = _DEFAULT_TELEGRAM_SEND_TIMEOUT_SECONDS
+    telegram_poll_timeout_seconds: float = _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
+    heartbeat_max_age_seconds: float = _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS
+    telegram_health_max_age_seconds: float = _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS
 
 
 def load_config() -> OrchestratorConfig:
@@ -114,6 +131,27 @@ def load_config() -> OrchestratorConfig:
         paperclip_timeout_seconds=_get_seconds(
             "PAPERCLIP_TIMEOUT_SECONDS", _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS
         ),
+        github_timeout_seconds=_get_seconds(
+            "GITHUB_TIMEOUT_SECONDS", _DEFAULT_GITHUB_TIMEOUT_SECONDS
+        ),
+        github_max_backoff_seconds=_get_seconds(
+            "GITHUB_MAX_BACKOFF_SECONDS", _DEFAULT_GITHUB_MAX_BACKOFF_SECONDS
+        ),
+        paperclip_max_backoff_seconds=_get_seconds(
+            "PAPERCLIP_MAX_BACKOFF_SECONDS", _DEFAULT_PAPERCLIP_MAX_BACKOFF_SECONDS
+        ),
+        telegram_send_timeout_seconds=_get_seconds(
+            "TELEGRAM_SEND_TIMEOUT_SECONDS", _DEFAULT_TELEGRAM_SEND_TIMEOUT_SECONDS
+        ),
+        telegram_poll_timeout_seconds=_get_seconds(
+            "TELEGRAM_POLL_TIMEOUT_SECONDS", _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
+        ),
+        heartbeat_max_age_seconds=_get_seconds(
+            "HEARTBEAT_MAX_AGE_SECONDS", _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS
+        ),
+        telegram_health_max_age_seconds=_get_seconds(
+            "TELEGRAM_HEALTH_MAX_AGE_SECONDS", _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS
+        ),
     )
 
 
@@ -137,6 +175,13 @@ def validate_config(config: OrchestratorConfig | None = None) -> list[str]:
     for name, default in (
         ("RETRY_INTERVAL_SECONDS", _DEFAULT_RETRY_INTERVAL_SECONDS),
         ("PAPERCLIP_TIMEOUT_SECONDS", _DEFAULT_PAPERCLIP_TIMEOUT_SECONDS),
+        ("GITHUB_TIMEOUT_SECONDS", _DEFAULT_GITHUB_TIMEOUT_SECONDS),
+        ("GITHUB_MAX_BACKOFF_SECONDS", _DEFAULT_GITHUB_MAX_BACKOFF_SECONDS),
+        ("PAPERCLIP_MAX_BACKOFF_SECONDS", _DEFAULT_PAPERCLIP_MAX_BACKOFF_SECONDS),
+        ("TELEGRAM_SEND_TIMEOUT_SECONDS", _DEFAULT_TELEGRAM_SEND_TIMEOUT_SECONDS),
+        ("TELEGRAM_POLL_TIMEOUT_SECONDS", _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
+        ("HEARTBEAT_MAX_AGE_SECONDS", _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS),
+        ("TELEGRAM_HEALTH_MAX_AGE_SECONDS", _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS),
     ):
         raw = _get(name)
         if raw is not None and _positive_seconds(raw) is None:

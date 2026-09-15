@@ -166,18 +166,25 @@ def _telegram_health(values, config, now, max_age) -> ComponentHealth:
 
 def get_health_status(*, store: Store | None = None, config: OrchestratorConfig | None = None,
                       clock=None, paperclip_probe=None, github_probe=None,
-                      heartbeat_max_age_seconds: float = 120,
-                      telegram_max_age_seconds: float = 172800) -> HealthReport:
+                      heartbeat_max_age_seconds: float | None = None,
+                      telegram_max_age_seconds: float | None = None) -> HealthReport:
     """Read bounded probes and persisted observations; missing evidence is unknown.
 
     pending_actions counts retryable/in-flight GitHub operations plus unresolved
     Paperclip claims. Terminal GitHub failures are reported separately.
     Runtime heartbeat production belongs to #30/#27, not this diagnostic call.
     """
+    cfg = config or load_config()
+    # #44: defaults come from config (HEARTBEAT_MAX_AGE_SECONDS/
+    # TELEGRAM_HEALTH_MAX_AGE_SECONDS) rather than being hardcoded here -
+    # an explicit caller-supplied value still always wins.
+    if heartbeat_max_age_seconds is None:
+        heartbeat_max_age_seconds = cfg.heartbeat_max_age_seconds
+    if telegram_max_age_seconds is None:
+        telegram_max_age_seconds = cfg.telegram_health_max_age_seconds
     for age in (heartbeat_max_age_seconds, telegram_max_age_seconds):
         if not math.isfinite(age) or age <= 0:
             raise ValueError('Health freshness windows must be finite and positive')
-    cfg = config or load_config()
     now = _utc(clock() if clock else None)
     report = HealthReport(now)
     report.components['paperclip'] = _observed_probe(paperclip_probe or (

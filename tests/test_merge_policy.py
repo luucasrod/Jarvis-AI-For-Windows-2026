@@ -13,6 +13,7 @@ import subprocess
 import pytest
 
 from orchestrator.audit import query_audit
+from orchestrator.config import OrchestratorConfig
 from orchestrator.events import EventType, emit, query_events
 from orchestrator.merge_policy import MergeOutcome, try_auto_merge
 from orchestrator.models import Task
@@ -630,4 +631,20 @@ def test_confirmed_merge_into_wrong_base_is_never_claimed_as_success(store, task
     result = _merge(task, store, run_fn=run_fn)
     assert result == MergeOutcome(merged=False, reason="merged_unexpected_base")
     assert query_events(store, event_types=[EventType.MERGE_COMPLETED]) == []
+    store.close()
+
+
+def test_gh_timeout_defaults_from_config_when_omitted(store, task):
+    # Issue #44: this used to be a hardcoded 30 constant regardless of
+    # config - an explicit caller value still wins, but omitting it must
+    # read GITHUB_TIMEOUT_SECONDS (shared with #17's own GitHubClient).
+    _pass_review(store, task)
+    seen = []
+
+    def run_fn(args, **kwargs):
+        seen.append(kwargs["timeout"])
+        return _Result(stdout=_view_json())
+
+    _merge(task, store, run_fn=run_fn, timeout=None, config=OrchestratorConfig(github_timeout_seconds=77))
+    assert seen and all(value == 77 for value in seen)
     store.close()

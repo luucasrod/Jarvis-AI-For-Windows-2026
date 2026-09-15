@@ -21,6 +21,13 @@ def _reload_with_clean_env(monkeypatch, **env_overrides):
         "SECONDBRAIN_INDEX_PATH",
         "RETRY_INTERVAL_SECONDS",
         "PAPERCLIP_TIMEOUT_SECONDS",
+        "GITHUB_TIMEOUT_SECONDS",
+        "GITHUB_MAX_BACKOFF_SECONDS",
+        "PAPERCLIP_MAX_BACKOFF_SECONDS",
+        "TELEGRAM_SEND_TIMEOUT_SECONDS",
+        "TELEGRAM_POLL_TIMEOUT_SECONDS",
+        "HEARTBEAT_MAX_AGE_SECONDS",
+        "TELEGRAM_HEALTH_MAX_AGE_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env_overrides.items():
@@ -43,6 +50,34 @@ def test_defaults_when_env_absent(monkeypatch):
     assert cfg.secondbrain_index_path == r"A:\SecondBrain\project_context_index.json"
     assert cfg.retry_interval_seconds == 30.0
     assert cfg.paperclip_timeout_seconds == 6.0
+    assert cfg.github_timeout_seconds == 30.0
+    assert cfg.github_max_backoff_seconds == 3600.0
+    assert cfg.paperclip_max_backoff_seconds == 3600.0
+    assert cfg.telegram_send_timeout_seconds == 10.0
+    assert cfg.telegram_poll_timeout_seconds == 15.0
+    assert cfg.heartbeat_max_age_seconds == 120.0
+    assert cfg.telegram_health_max_age_seconds == 172800.0
+
+
+def test_new_44_duration_settings_are_overridable(monkeypatch):
+    mod = _reload_with_clean_env(
+        monkeypatch,
+        GITHUB_TIMEOUT_SECONDS="45",
+        GITHUB_MAX_BACKOFF_SECONDS="1800",
+        PAPERCLIP_MAX_BACKOFF_SECONDS="900",
+        TELEGRAM_SEND_TIMEOUT_SECONDS="12",
+        TELEGRAM_POLL_TIMEOUT_SECONDS="20",
+        HEARTBEAT_MAX_AGE_SECONDS="60",
+        TELEGRAM_HEALTH_MAX_AGE_SECONDS="3600",
+    )
+    cfg = mod.load_config()
+    assert cfg.github_timeout_seconds == 45.0
+    assert cfg.github_max_backoff_seconds == 1800.0
+    assert cfg.paperclip_max_backoff_seconds == 900.0
+    assert cfg.telegram_send_timeout_seconds == 12.0
+    assert cfg.telegram_poll_timeout_seconds == 20.0
+    assert cfg.heartbeat_max_age_seconds == 60.0
+    assert cfg.telegram_health_max_age_seconds == 3600.0
 
 
 def test_secondbrain_index_path_overridable(monkeypatch):
@@ -136,6 +171,13 @@ def test_duration_overrides_and_complete_config_are_valid(monkeypatch, caplog):
 @pytest.mark.parametrize("name,default", [
     ("RETRY_INTERVAL_SECONDS", 30.0),
     ("PAPERCLIP_TIMEOUT_SECONDS", 6.0),
+    ("GITHUB_TIMEOUT_SECONDS", 30.0),
+    ("GITHUB_MAX_BACKOFF_SECONDS", 3600.0),
+    ("PAPERCLIP_MAX_BACKOFF_SECONDS", 3600.0),
+    ("TELEGRAM_SEND_TIMEOUT_SECONDS", 10.0),
+    ("TELEGRAM_POLL_TIMEOUT_SECONDS", 15.0),
+    ("HEARTBEAT_MAX_AGE_SECONDS", 120.0),
+    ("TELEGRAM_HEALTH_MAX_AGE_SECONDS", 172800.0),
 ])
 @pytest.mark.parametrize("invalid", ["0", "-1", "nan", "inf", "not-a-number"])
 def test_invalid_durations_fall_back_and_log_names_only(monkeypatch, caplog, name, default, invalid):

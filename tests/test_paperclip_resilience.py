@@ -187,3 +187,11 @@ def test_invalid_backoff_configuration_rejected(base, cap):
     with pytest.raises(ValueError):
         PaperclipSession(config=OrchestratorConfig(retry_interval_seconds=base),
                          max_backoff_seconds=cap)
+
+
+def test_max_backoff_defaults_from_config_when_omitted():
+    # Issue #44: this used to be a hardcoded 3600 constant regardless of
+    # config - an explicit caller value still wins, but omitting it must
+    # read PAPERCLIP_MAX_BACKOFF_SECONDS.
+    session = PaperclipSession(config=OrchestratorConfig(paperclip_max_backoff_seconds=99))
+    assert session._max_backoff == 99

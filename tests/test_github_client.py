@@ -348,3 +348,18 @@ def test_update_issue_body_reports_transport_failure(setup):
     result = client.update_issue_body('Owner/Repo', 1, 'new body')
     assert result['available'] is False
     assert github.issues[0]['body'] != 'new body'
+
+
+def test_timeout_and_backoff_default_from_config_when_omitted(tmp_path):
+    # Issue #44: these used to be hardcoded 30/3600 constants regardless
+    # of config - an explicit caller value must still win, but omitting
+    # both must read GITHUB_TIMEOUT_SECONDS/GITHUB_MAX_BACKOFF_SECONDS.
+    store = Store(tmp_path / 'state.db')
+    client = GitHubClient(
+        store, config=OrchestratorConfig(
+            retry_interval_seconds=10, github_timeout_seconds=17, github_max_backoff_seconds=222,
+        ),
+    )
+    assert client.timeout == 17
+    assert client.max_backoff == 222
+    store.close()

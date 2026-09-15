@@ -112,9 +112,14 @@ def _valid_issue(item) -> bool:
 class GitHubClient:
     def __init__(self, store: Store, *, config: OrchestratorConfig | None = None,
                  run_fn: Callable | None = None, clock: Callable[[], datetime] | None = None,
-                 timeout_seconds: float = 30, max_backoff_seconds: float = 3600):
+                 timeout_seconds: float | None = None, max_backoff_seconds: float | None = None):
         self.store = store
         cfg = config or load_config()
+        # #44: defaults come from config (GITHUB_TIMEOUT_SECONDS/
+        # GITHUB_MAX_BACKOFF_SECONDS) rather than being hardcoded here -
+        # an explicit caller-supplied value still always wins.
+        timeout_seconds = timeout_seconds if timeout_seconds is not None else cfg.github_timeout_seconds
+        max_backoff_seconds = max_backoff_seconds if max_backoff_seconds is not None else cfg.github_max_backoff_seconds
         for number in (cfg.retry_interval_seconds, timeout_seconds, max_backoff_seconds):
             if not math.isfinite(number) or number <= 0:
                 raise ValueError('GitHub durations must be positive and finite')
