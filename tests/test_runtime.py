@@ -70,6 +70,31 @@ def test_unrecognized_text_reaches_the_free_conversation_fallback(store):
     assert sent == ["resposta livre"]
 
 
+def test_confirm_fn_is_threaded_through_to_handle_control_message(store):
+    # Issue #152: a "sim" that resolves a pending plan must reach the
+    # SAME confirm_fn the caller wired into run_forever, not a default.
+    # Seeds a pending plan directly (bypassing the real planner, which
+    # needs a real LLM/project index - out of scope for this unit test).
+    from orchestrator.decisions import save_pending_plan
+    save_pending_plan(store, objective="testar", project_id="hub", task_ids=["t1"])
+
+    def fake_get(url, params, timeout):
+        if "getUpdates" in url:
+            return _FakeResponse(200, {
+                "result": [{"update_id": 1, "message": {"chat": {"id": 111}, "text": "sim"}}]
+            })
+        return _FakeResponse(200, {"ok": True, "result": {"message_id": 1}})
+
+    seen = []
+    run_forever(
+        store=store, config=_CONFIGURED, iterations=1, get_fn=fake_get,
+        send_fn=lambda text, **k: (True, None),
+        confirm_fn=lambda pending_plan: (seen.append(pending_plan), "ok")[1],
+    )
+
+    assert seen == [{"objective": "testar", "project_id": "hub", "task_ids": ["t1"]}]
+
+
 def test_no_new_messages_never_calls_fallback_or_send(store):
     def fake_get(url, params, timeout):
         return _FakeResponse(200, {"result": []})

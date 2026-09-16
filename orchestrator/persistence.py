@@ -128,6 +128,11 @@ class Store:
             return None
         return Task.from_dict(json.loads(row[0]))
 
+    def delete_task(self, task_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            self._conn.commit()
+
     def list_tasks(self, state: TaskState | None = None) -> list[Task]:
         with self._lock:
             if state is None:
