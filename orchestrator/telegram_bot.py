@@ -34,6 +34,7 @@ from orchestrator.events import EventType, emit
 from orchestrator.persistence import Store
 
 _API_BASE = "https://api.telegram.org/bot{token}"
+_FILE_BASE = "https://api.telegram.org/file/bot{token}/{path}"
 
 
 def _url(token: str, method: str) -> str:
@@ -116,11 +117,86 @@ def send_report_message(
                             _send_message(config.telegram_report_chat_id, text, config, post_fn))
 
 
+def _download_telegram_file(
+    file_id: str, config: OrchestratorConfig, get_fn: Callable,
+) -> bytes | None:
+    """Resolves a Telegram file_id to its bytes via getFile + the file
+    download endpoint. Returns None on any failure - a voice message that
+    can't be fetched degrades to "no text this update", never a crash."""
+    try:
+        info = get_fn(
+            _url(config.telegram_bot_token, "getFile"),
+            params={"file_id": file_id}, timeout=config.telegram_poll_timeout_seconds,
+        )
+        if info.status_code != 200:
+            return None
+        data = info.json()
+        if not isinstance(data, dict):
+            return None
+        file_path = (data.get("result") or {}).get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            return None
+        content = get_fn(
+            _FILE_BASE.format(token=config.telegram_bot_token, path=file_path),
+            params=None, timeout=config.telegram_poll_timeout_seconds,
+        )
+        if content.status_code != 200:
+            return None
+        return content.content
+    except Exception:
+        return None
+
+
+def _real_groq_client(api_key: str):
+    from groq import Groq
+
+    return Groq(api_key=api_key)
+
+
+def _transcribe_telegram_voice(
+    file_id: str, config: OrchestratorConfig, get_fn: Callable,
+    groq_client_factory: Callable[[str], object] | None = None,
+) -> str | None:
+    """Downloads a Telegram voice/audio message and transcribes it via
+    Groq Whisper - the SAME model/language main.py's own take_command()
+    already uses for local microphone input (issue #148), so a command
+    sent by voice through the control channel is transcribed consistently
+    with the rest of Jarvis. Returns None (never raises) on any failure:
+    missing GROQ_API_KEY, unreachable file, unreachable Groq (including
+    the `groq` package not being installed at all - this orchestrator
+    package's own test/CI environment deliberately doesn't carry it, only
+    main.py's runtime venv does), or empty transcription - the caller
+    treats that exactly like a message with no text at all.
+
+    `groq_client_factory` defaults to constructing a real `groq.Groq`
+    client (imported lazily, only when actually needed) - injected in
+    tests so they never need the `groq` package importable at all."""
+    if not config.groq_api_key:
+        return None
+    audio_bytes = _download_telegram_file(file_id, config, get_fn)
+    if not audio_bytes:
+        return None
+    try:
+        make_client = groq_client_factory or _real_groq_client
+        client = make_client(config.groq_api_key)
+        result = client.audio.transcriptions.create(
+            file=("voice.ogg", audio_bytes),
+            model=config.groq_transcribe_model,
+            language="pt",
+            response_format="text",
+        )
+        text = (result if isinstance(result, str) else getattr(result, "text", "")).strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def receive_control_updates(
     store: Store,
     config: OrchestratorConfig | None = None,
     last_update_id: int | None = None,
     get_fn: Callable | None = None,
+    transcribe_fn: Callable | None = None,
 ) -> int | None:
     """Polls Telegram's getUpdates ONCE for new messages in the control
     channel, emits a telegram_message_received event per new message, and
@@ -128,6 +204,16 @@ def receive_control_updates(
     (so messages are never processed twice). Messages from any chat other
     than the configured control chat are ignored (defense against a
     misconfigured or unexpected sender).
+
+    A message with no `text` but a `voice`/`audio` attachment (issue #148)
+    is transcribed via `transcribe_fn` (defaults to
+    `_transcribe_telegram_voice`, Groq Whisper) and the transcribed text
+    is emitted exactly like a typed message - the downstream grammar
+    parser (#31's `decisions.handle_control_message`) never knows the
+    difference. A voice message that fails to download/transcribe (no
+    GROQ_API_KEY, bad audio, Groq unreachable) is emitted with empty
+    text, same as any other message the parser can't make sense of -
+    never a crash, never a lost cursor.
 
     Returns `last_update_id` unchanged (never raises) on any failure -
     Telegram being unreachable must never crash Jarvis."""
@@ -198,10 +284,18 @@ def receive_control_updates(
             continue
 
         text = message.get("text", "")
+        transcribed = False
+        if not text:
+            voice = message.get("voice") or message.get("audio")
+            file_id = voice.get("file_id") if isinstance(voice, dict) else None
+            if isinstance(file_id, str) and file_id:
+                transcribe = transcribe_fn or _transcribe_telegram_voice
+                text = transcribe(file_id, config, get) or ""
+                transcribed = bool(text)
         emit(
             store,
             EventType.TELEGRAM_MESSAGE_RECEIVED,
-            {"chat_id": chat_id, "text": text, "update_id": update_id},
+            {"chat_id": chat_id, "text": text, "update_id": update_id, "transcribed": transcribed},
         )
 
     return new_last_update_id

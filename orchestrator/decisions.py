@@ -397,10 +397,15 @@ def _route_control(text: str, store: Store, plan_fn: Callable) -> ControlResult:
         if option and not re.search(rf'^{option[1].upper()}\) ', matches[0]['message'], re.MULTILINE):
             return ControlResult('clarification', 'Essa opcao nao aparece na decisao. Confira as opcoes antes de responder.')
         return _answer_decision(store, matches[0], response)
-    is_objective = re.match(r'^(?:objetivo\s*:|quero que\s+|cria(?:r)?\s+|crie\s+|implementa(?:r)?\s+|implemente\s+|corrig[ae]\s+|corrigir\s+|adiciona(?:r)?\s+|adicione\s+)', normalized)
+    # "objetivo" tolerates a missing colon (issue #148): speech-to-text
+    # transcription of a spoken command naturally drops punctuation, and
+    # every OTHER trigger verb here ("quero que", "cria", "implementa", ...)
+    # already needs no colon at all - "objetivo" alone required one, which
+    # silently rejected a genuine spoken "Objetivo testar..." command.
+    is_objective = re.match(r'^(?:objetivo\s*:\s*|objetivo\s+|quero que\s+|cria(?:r)?\s+|crie\s+|implementa(?:r)?\s+|implemente\s+|corrig[ae]\s+|corrigir\s+|adiciona(?:r)?\s+|adicione\s+)', normalized)
     if not is_objective:
         return ControlResult('clarification', 'Nao consegui distinguir objetivo, resposta ou prioridade. Use Objetivo: <pedido>, REF: <referencia> <resposta> ou Prioriza <ID da tarefa>.')
-    objective = re.sub(r'^objetivo\s*:\s*', '', text, flags=re.IGNORECASE).strip()
+    objective = re.sub(r'^objetivo\s*:?\s*', '', text, flags=re.IGNORECASE).strip()
     if not objective:
         return ControlResult('clarification', 'Descreva o objetivo que deseja planejar.')
     try:

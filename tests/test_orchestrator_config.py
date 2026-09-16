@@ -28,6 +28,8 @@ def _reload_with_clean_env(monkeypatch, **env_overrides):
         "TELEGRAM_POLL_TIMEOUT_SECONDS",
         "HEARTBEAT_MAX_AGE_SECONDS",
         "TELEGRAM_HEALTH_MAX_AGE_SECONDS",
+        "GROQ_API_KEY",
+        "GROQ_TRANSCRIBE_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env_overrides.items():
@@ -57,6 +59,8 @@ def test_defaults_when_env_absent(monkeypatch):
     assert cfg.telegram_poll_timeout_seconds == 15.0
     assert cfg.heartbeat_max_age_seconds == 120.0
     assert cfg.telegram_health_max_age_seconds == 172800.0
+    assert cfg.groq_api_key is None
+    assert cfg.groq_transcribe_model == "whisper-large-v3-turbo"
 
 
 def test_new_44_duration_settings_are_overridable(monkeypatch):
@@ -69,6 +73,8 @@ def test_new_44_duration_settings_are_overridable(monkeypatch):
         TELEGRAM_POLL_TIMEOUT_SECONDS="20",
         HEARTBEAT_MAX_AGE_SECONDS="60",
         TELEGRAM_HEALTH_MAX_AGE_SECONDS="3600",
+        GROQ_API_KEY="fake-groq-key",
+        GROQ_TRANSCRIBE_MODEL="whisper-large-v3",
     )
     cfg = mod.load_config()
     assert cfg.github_timeout_seconds == 45.0
@@ -78,6 +84,8 @@ def test_new_44_duration_settings_are_overridable(monkeypatch):
     assert cfg.telegram_poll_timeout_seconds == 20.0
     assert cfg.heartbeat_max_age_seconds == 60.0
     assert cfg.telegram_health_max_age_seconds == 3600.0
+    assert cfg.groq_api_key == "fake-groq-key"
+    assert cfg.groq_transcribe_model == "whisper-large-v3"
 
 
 def test_secondbrain_index_path_overridable(monkeypatch):

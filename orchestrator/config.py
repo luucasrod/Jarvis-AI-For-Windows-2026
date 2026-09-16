@@ -32,6 +32,11 @@ _DEFAULT_TELEGRAM_SEND_TIMEOUT_SECONDS = 10.0
 _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 15.0
 _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 120.0
 _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS = 172800.0
+# #148: same Groq account/model main.py's own take_command() already uses
+# for local voice transcription (whisper-large-v3-turbo) - reused here so
+# a voice message sent to the Telegram control channel transcribes the
+# same way, without provisioning a second speech-to-text provider.
+_DEFAULT_GROQ_TRANSCRIBE_MODEL = "whisper-large-v3-turbo"
 
 
 def _load_dotenv(path: Path) -> None:
@@ -105,6 +110,8 @@ class OrchestratorConfig:
     telegram_poll_timeout_seconds: float = _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     heartbeat_max_age_seconds: float = _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS
     telegram_health_max_age_seconds: float = _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS
+    groq_api_key: str | None = field(default=None)
+    groq_transcribe_model: str = _DEFAULT_GROQ_TRANSCRIBE_MODEL
 
 
 def load_config() -> OrchestratorConfig:
@@ -152,6 +159,8 @@ def load_config() -> OrchestratorConfig:
         telegram_health_max_age_seconds=_get_seconds(
             "TELEGRAM_HEALTH_MAX_AGE_SECONDS", _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS
         ),
+        groq_api_key=_get("GROQ_API_KEY"),
+        groq_transcribe_model=_get("GROQ_TRANSCRIBE_MODEL", _DEFAULT_GROQ_TRANSCRIBE_MODEL),
     )
 
 
