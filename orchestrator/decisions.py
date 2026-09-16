@@ -372,7 +372,7 @@ def _prioritize(store: Store, target: str) -> ControlResult:
     return store.run_in_transaction(apply)
 
 
-def _route_control(text: str, store: Store, plan_fn: Callable) -> ControlResult:
+def _route_control(text: str, store: Store, plan_fn: Callable, fallback_fn: Callable | None = None) -> ControlResult:
     normalized = _normalized(text)
     priority = re.match(r'^(?:prioriza|priorize|priorizar)\s+(?:a\s+)?(?:tarefa\s+)?(.+)$', text, re.IGNORECASE)
     if priority:
@@ -404,6 +404,15 @@ def _route_control(text: str, store: Store, plan_fn: Callable) -> ControlResult:
     # silently rejected a genuine spoken "Objetivo testar..." command.
     is_objective = re.match(r'^(?:objetivo\s*:\s*|objetivo\s+|quero que\s+|cria(?:r)?\s+|crie\s+|implementa(?:r)?\s+|implemente\s+|corrig[ae]\s+|corrigir\s+|adiciona(?:r)?\s+|adicione\s+)', normalized)
     if not is_objective:
+        # Issue #149: text that matches NONE of the structured shapes above
+        # (no side effect has happened yet on this path - every branch that
+        # DOES mutate state returns before reaching here) falls to free
+        # conversation instead of a bare "nao entendi", when the caller
+        # wired one in. Never invents state - see conversation.py.
+        if fallback_fn is not None:
+            answer = fallback_fn(text)
+            if answer:
+                return ControlResult('conversation', answer)
         return ControlResult('clarification', 'Nao consegui distinguir objetivo, resposta ou prioridade. Use Objetivo: <pedido>, REF: <referencia> <resposta> ou Prioriza <ID da tarefa>.')
     objective = re.sub(r'^objetivo\s*:?\s*', '', text, flags=re.IGNORECASE).strip()
     if not objective:
@@ -420,19 +429,22 @@ def _route_control(text: str, store: Store, plan_fn: Callable) -> ControlResult:
 
 def handle_control_message(text: str, *, store: Store | None = None,
                            plan_fn: Callable | None = None,
-                           send_fn: Callable | None = None) -> ControlResult:
+                           send_fn: Callable | None = None,
+                           fallback_fn: Callable | None = None) -> ControlResult:
     """Route text already authenticated by #19's control-chat filter.
 
     Return the plan to #23/runtime for persistence/dispatch. Decision replies
     persist atomically and emit DECISION_RECEIVED for that exact correlation;
     the last answer readmits only NEEDS_LUCAS tasks, preserving agent assignment.
-    Ambiguous text asks for clarification instead of guessing an action.
+    Ambiguous text asks for clarification instead of guessing an action,
+    unless `fallback_fn` (issue #149's free-conversation answer) is given -
+    then it answers instead of just asking the sender to rephrase.
     """
     owned = store is None
     active_store = store if store is not None else Store()
     try:
         try:
-            result = (_route_control(text.strip(), active_store, plan_fn or plan)
+            result = (_route_control(text.strip(), active_store, plan_fn or plan, fallback_fn)
                       if isinstance(text, str) and text.strip() else
                       ControlResult('clarification', 'Envie um objetivo, resposta ou comando de prioridade em texto.'))
         except sqlite3.Error:

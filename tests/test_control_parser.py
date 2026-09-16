@@ -61,6 +61,47 @@ def test_new_objective_uses_real_three_stage_planner(store):
     assert store.list_tasks() == []  # #23 owns publishing/persisting the plan
 
 
+def test_unrecognized_text_falls_back_to_free_conversation_when_wired(store):
+    # Issue #149: text matching NONE of the structured shapes (Objetivo/
+    # REF/Prioriza) answers via fallback_fn instead of a bare "nao entendi".
+    seen = []
+    def fallback(text):
+        seen.append(text)
+        return "Resposta livre baseada em dados reais."
+
+    result = route(store, 'Quais projetos voce consegue mexer agora?', fallback_fn=fallback)
+
+    assert seen == ['Quais projetos voce consegue mexer agora?']
+    assert result.kind == 'conversation'
+    assert result.message == "Resposta livre baseada em dados reais."
+
+
+def test_without_fallback_fn_unrecognized_text_still_asks_for_clarification(store):
+    # No regression: omitting fallback_fn (the default) keeps the original
+    # behavior exactly as it was before #149.
+    result = route(store, 'Quais projetos voce consegue mexer agora?')
+    assert result.kind == 'clarification'
+    assert 'Objetivo:' in result.message
+
+
+def test_fallback_fn_returning_empty_string_still_asks_for_clarification(store):
+    result = route(store, 'oi tudo bem?', fallback_fn=lambda text: '')
+    assert result.kind == 'clarification'
+
+
+@pytest.mark.parametrize('text', [
+    'REF: xyz sim',            # explicit reply grammar, ambiguous/no match
+    'sim',                      # bare option/yes-no with no pending decision
+    'Objetivo:',                # recognized as objective, but empty content
+    'Prioriza tarefa-123',      # priority command, has its own real handler
+])
+def test_fallback_fn_never_called_for_recognized_structured_shapes(store, text):
+    def fail_fallback(text):
+        pytest.fail('fallback_fn must not run for a recognized structured command')
+
+    route(store, text, fallback_fn=fail_fallback)
+
+
 def test_objective_without_colon_is_accepted(store):
     # Issue #148: a voice message transcribed via Groq Whisper naturally
     # drops punctuation ("Objetivo testar X" not "Objetivo: testar X").
