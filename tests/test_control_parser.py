@@ -61,6 +61,21 @@ def test_new_objective_uses_real_three_stage_planner(store):
     assert store.list_tasks() == []  # #23 owns publishing/persisting the plan
 
 
+def test_objective_without_colon_is_accepted(store):
+    # Issue #148: a voice message transcribed via Groq Whisper naturally
+    # drops punctuation ("Objetivo testar X" not "Objetivo: testar X").
+    # Every other trigger verb here ("quero que", "cria", ...) already
+    # needs no colon at all - "objetivo" alone must be consistent with
+    # them, or a genuine spoken command from #148 is silently rejected.
+    calls = []
+    from orchestrator.planner import PlanResult
+    def planner(objective, **kwargs):
+        calls.append(objective)
+        return PlanResult()
+    assert route(store, 'Objetivo testar transcricao de voz', plan_fn=planner).kind == 'plan'
+    assert calls == ['testar transcricao de voz']
+
+
 def test_explicit_new_objective_is_not_consumed_by_pending_decision(store):
     pending(store)
     calls = []

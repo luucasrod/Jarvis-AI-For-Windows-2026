@@ -16,9 +16,10 @@ _UNCONFIGURED = OrchestratorConfig()
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, json_data=None):
+    def __init__(self, status_code=200, json_data=None, content=b""):
         self.status_code = status_code
         self._json_data = json_data if json_data is not None else {'ok': True, 'result': {'message_id': 1}}
+        self.content = content
 
     def json(self):
         return self._json_data
@@ -340,3 +341,241 @@ def test_send_message_error_never_leaks_url_or_token():
     assert ok is False
     assert "fake-token" not in error
     assert "http" not in error.lower()
+
+
+# --- issue #148: voice messages in the control channel -----------------------
+
+def test_voice_message_is_transcribed_and_emitted_as_text(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {
+            "result": [
+                {"update_id": 9001, "message": {"chat": {"id": 111}, "voice": {"file_id": "voice-abc"}}}
+            ]
+        })
+
+    seen = []
+
+    def fake_transcribe(file_id, config, get_fn):
+        seen.append(file_id)
+        return "Objetivo: testar por voz"
+
+    receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, transcribe_fn=fake_transcribe)
+
+    assert seen == ["voice-abc"]
+    events = query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED])
+    assert events[0]["payload"]["text"] == "Objetivo: testar por voz"
+    assert events[0]["payload"]["transcribed"] is True
+    store.close()
+
+
+def test_audio_message_also_transcribed_like_voice(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {
+            "result": [{"update_id": 1, "message": {"chat": {"id": 111}, "audio": {"file_id": "audio-xyz"}}}]
+        })
+
+    receive_control_updates(
+        store, config=_CONFIGURED, get_fn=fake_get,
+        transcribe_fn=lambda file_id, config, get_fn: f"transcrito:{file_id}",
+    )
+
+    events = query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED])
+    assert events[0]["payload"]["text"] == "transcrito:audio-xyz"
+    store.close()
+
+
+def test_text_message_never_triggers_transcription(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {
+            "result": [{"update_id": 1, "message": {"chat": {"id": 111}, "text": "Objetivo: X",
+                                                     "voice": {"file_id": "should-be-ignored"}}}]
+        })
+
+    def fail_transcribe(*a, **k):
+        raise AssertionError("must not be called when text is already present")
+
+    receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, transcribe_fn=fail_transcribe)
+
+    events = query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED])
+    assert events[0]["payload"]["text"] == "Objetivo: X"
+    assert events[0]["payload"]["transcribed"] is False
+    store.close()
+
+
+def test_voice_message_transcription_failure_emits_empty_text_not_a_crash(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {
+            "result": [{"update_id": 1, "message": {"chat": {"id": 111}, "voice": {"file_id": "bad-audio"}}}]
+        })
+
+    new_offset = receive_control_updates(
+        store, config=_CONFIGURED, get_fn=fake_get,
+        transcribe_fn=lambda file_id, config, get_fn: None,
+    )
+
+    assert new_offset == 1
+    events = query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED])
+    assert events[0]["payload"]["text"] == ""
+    assert events[0]["payload"]["transcribed"] is False
+    store.close()
+
+
+def test_voice_message_without_file_id_is_ignored_safely(tmp_path):
+    store = Store(tmp_path / "state.db")
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {
+            "result": [{"update_id": 1, "message": {"chat": {"id": 111}, "voice": {}}}]
+        })
+
+    def fail_transcribe(*a, **k):
+        raise AssertionError("must not be called without a file_id")
+
+    receive_control_updates(store, config=_CONFIGURED, get_fn=fake_get, transcribe_fn=fail_transcribe)
+
+    events = query_events(store, event_types=[EventType.TELEGRAM_MESSAGE_RECEIVED])
+    assert events[0]["payload"]["text"] == ""
+    store.close()
+
+
+def test_download_telegram_file_happy_path_returns_bytes():
+    from orchestrator.telegram_bot import _download_telegram_file
+
+    calls = []
+
+    def fake_get(url, timeout, params=None):
+        calls.append(url)
+        if "getFile" in url:
+            return _FakeResponse(200, {"result": {"file_path": "voice/file_1.oga"}})
+        return _FakeResponse(200, content=b"fake-ogg-bytes")
+
+    result = _download_telegram_file("voice-abc", _CONFIGURED, fake_get)
+    assert result == b"fake-ogg-bytes"
+    assert any("getFile" in c for c in calls)
+    assert any("file/botfake-token/voice/file_1.oga" in c for c in calls)
+
+
+def test_download_telegram_file_returns_none_when_get_file_fails():
+    from orchestrator.telegram_bot import _download_telegram_file
+
+    def fake_get(url, timeout, params=None):
+        return _FakeResponse(404)
+
+    assert _download_telegram_file("voice-abc", _CONFIGURED, fake_get) is None
+
+
+def test_download_telegram_file_returns_none_on_missing_file_path():
+    from orchestrator.telegram_bot import _download_telegram_file
+
+    def fake_get(url, timeout, params=None):
+        return _FakeResponse(200, {"result": {}})
+
+    assert _download_telegram_file("voice-abc", _CONFIGURED, fake_get) is None
+
+
+def test_download_telegram_file_never_raises_on_network_exception():
+    from orchestrator.telegram_bot import _download_telegram_file
+
+    def fake_get(url, timeout, params=None):
+        raise ConnectionError("offline")
+
+    assert _download_telegram_file("voice-abc", _CONFIGURED, fake_get) is None
+
+
+def test_transcribe_telegram_voice_without_groq_key_returns_none_without_downloading():
+    from orchestrator.telegram_bot import _transcribe_telegram_voice
+
+    def fail_get(*a, **k):
+        raise AssertionError("must not attempt download without a Groq API key")
+
+    cfg = OrchestratorConfig(telegram_bot_token="fake-token", groq_api_key=None)
+    assert _transcribe_telegram_voice("voice-abc", cfg, fail_get) is None
+
+
+def test_transcribe_telegram_voice_calls_groq_with_downloaded_audio():
+    # groq_client_factory injection means this never needs the real `groq`
+    # package importable - this package's own test/CI env deliberately
+    # doesn't carry it (only main.py's runtime venv does).
+    from orchestrator.telegram_bot import _transcribe_telegram_voice
+
+    def fake_get(url, timeout, params=None):
+        if "getFile" in url:
+            return _FakeResponse(200, {"result": {"file_path": "voice/file_1.oga"}})
+        return _FakeResponse(200, content=b"real-audio-bytes")
+
+    captured = {}
+
+    class _FakeTranscriptions:
+        def create(self, *, file, model, language, response_format):
+            captured["file"] = file
+            captured["model"] = model
+            captured["language"] = language
+            return "Objetivo: transcrito de verdade"
+
+    class _FakeAudio:
+        transcriptions = _FakeTranscriptions()
+
+    class _FakeGroqClient:
+        def __init__(self, api_key):
+            captured["api_key"] = api_key
+            self.audio = _FakeAudio()
+
+    cfg = OrchestratorConfig(telegram_bot_token="fake-token", groq_api_key="fake-groq-key")
+    result = _transcribe_telegram_voice("voice-abc", cfg, fake_get, groq_client_factory=_FakeGroqClient)
+
+    assert result == "Objetivo: transcrito de verdade"
+    assert captured["api_key"] == "fake-groq-key"
+    assert captured["model"] == "whisper-large-v3-turbo"
+    assert captured["language"] == "pt"
+    assert captured["file"][1] == b"real-audio-bytes"
+
+
+def test_transcribe_telegram_voice_returns_none_when_groq_raises():
+    from orchestrator.telegram_bot import _transcribe_telegram_voice
+
+    def fake_get(url, timeout, params=None):
+        if "getFile" in url:
+            return _FakeResponse(200, {"result": {"file_path": "voice/file_1.oga"}})
+        return _FakeResponse(200, content=b"real-audio-bytes")
+
+    class _FakeGroqClient:
+        def __init__(self, api_key):
+            pass
+
+        class audio:
+            class transcriptions:
+                @staticmethod
+                def create(**kwargs):
+                    raise RuntimeError("groq is down")
+
+    cfg = OrchestratorConfig(telegram_bot_token="fake-token", groq_api_key="fake-groq-key")
+    assert _transcribe_telegram_voice("voice-abc", cfg, fake_get, groq_client_factory=_FakeGroqClient) is None
+
+
+def test_transcribe_telegram_voice_returns_none_on_empty_transcription():
+    from orchestrator.telegram_bot import _transcribe_telegram_voice
+
+    def fake_get(url, timeout, params=None):
+        if "getFile" in url:
+            return _FakeResponse(200, {"result": {"file_path": "voice/file_1.oga"}})
+        return _FakeResponse(200, content=b"real-audio-bytes")
+
+    class _FakeGroqClient:
+        def __init__(self, api_key):
+            self.audio = self
+
+        class transcriptions:
+            @staticmethod
+            def create(**kwargs):
+                return "   "
+
+    cfg = OrchestratorConfig(telegram_bot_token="fake-token", groq_api_key="fake-groq-key")
+    assert _transcribe_telegram_voice("voice-abc", cfg, fake_get, groq_client_factory=_FakeGroqClient) is None
