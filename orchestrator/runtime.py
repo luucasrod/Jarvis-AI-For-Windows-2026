@@ -10,12 +10,10 @@ left "the actual repeated-polling loop" for whichever issue wires the
 runtime. Without this, every prior "live test" only worked because a
 human ran a one-off script by hand for that single message.
 
-Scope, deliberately: this bridges Telegram's TWO existing channels to the
-control/report machinery that already exists. It does NOT dispatch tasks
-to Paperclip agents or run #30's daily cycle - that is a materially
-bigger, higher-stakes piece (real task assignment) the user has not asked
-for today, and pulling it in here would silently expand this issue's risk
-far past "make the two channels actually talk".
+Real GitHub/Paperclip dispatch (issue #152) is wired in too, but ONLY
+behind the user's own explicit "sim" confirming a specific proposed plan
+- see decisions.py's `confirm_fn` contract and plan_confirmation.py's
+`execute_confirmed_plan`. This loop never dispatches anything on its own.
 """
 from __future__ import annotations
 
@@ -30,6 +28,7 @@ from orchestrator.conversation import answer_free_text
 from orchestrator.decisions import handle_control_message
 from orchestrator.events import EventType, query_events
 from orchestrator.persistence import Store
+from orchestrator.plan_confirmation import execute_confirmed_plan
 from orchestrator.reporting import process_report_tick
 from orchestrator.telegram_bot import receive_control_updates, send_control_message
 
@@ -40,7 +39,7 @@ _DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 def _process_new_control_messages(
     store: Store, config: OrchestratorConfig, *,
     poll_started_at: datetime, previous_update_id: int | None,
-    send_fn: Callable | None, fallback_fn: Callable | None,
+    send_fn: Callable | None, fallback_fn: Callable | None, confirm_fn: Callable | None = None,
 ) -> None:
     """`receive_control_updates` only emits an event per message (#19's own
     deliberate scope boundary - it does not interpret meaning). This reads
@@ -66,6 +65,7 @@ def _process_new_control_messages(
                 text, store=store,
                 send_fn=send_fn or partial(send_control_message, config=config),
                 fallback_fn=fallback_fn or partial(answer_free_text, store=store, config=config),
+                confirm_fn=confirm_fn or partial(execute_confirmed_plan, store=store, config=config),
             )
         except Exception:
             # A single malformed/unlucky message must never stop the loop
@@ -78,6 +78,7 @@ def run_forever(
     poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     iterations: int | None = None,
     send_fn: Callable | None = None, fallback_fn: Callable | None = None,
+    confirm_fn: Callable | None = None,
     report_send_fn: Callable | None = None,
     get_fn: Callable | None = None, transcribe_fn: Callable | None = None,
 ) -> None:
@@ -110,6 +111,7 @@ def run_forever(
                     _process_new_control_messages(
                         active_store, cfg, poll_started_at=poll_started_at,
                         previous_update_id=previous_update_id, send_fn=send_fn, fallback_fn=fallback_fn,
+                        confirm_fn=confirm_fn,
                     )
                 except Exception:
                     # query_events/sqlite trouble here must not kill the

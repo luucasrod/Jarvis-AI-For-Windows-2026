@@ -64,6 +64,23 @@ def _get(path: str, *, base_url: str | None = None, timeout: float | None = None
         return None, "resposta inválida (não é JSON)"
 
 
+def list_companies() -> tuple[list[dict], str | None]:
+    """Raw company id+name pairs - the one thing `get_snapshot()`'s own
+    reduced view deliberately drops (it only ever needed the name for a
+    spoken summary). Used by #152 to resolve which real Paperclip company
+    a project maps to before dispatching real work to it.
+
+    Returns (companies, error): on success `error` is None and each
+    company dict has at least "id"/"name"; on any failure `companies` is
+    `[]` and `error` is a short reason string. Never raises."""
+    companies, err = _get("/api/companies")
+    if err:
+        return [], err
+    if not isinstance(companies, list):
+        return [], "resposta inesperada (sem lista de empresas)"
+    return [c for c in companies if isinstance(c, dict) and c.get("id")], None
+
+
 def get_snapshot() -> dict:
     """
     Consolida o estado atual do Paperclip numa estrutura pronta pra virar

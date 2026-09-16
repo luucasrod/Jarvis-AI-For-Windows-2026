@@ -53,12 +53,14 @@ def test_new_objective_uses_real_three_stage_planner(store):
         return next(outputs)
     result = route(store, 'Quero que o Argos crie uma tela de status',
                    plan_fn=partial(plan, resolver=Resolver(), llm_generate=llm))
-    assert result.kind == 'plan' and result.delivered
+    # Issue #152: a successful plan with real tasks is PROPOSED, not
+    # auto-executed - it must be confirmed before touching GitHub/Paperclip.
+    assert result.kind == 'plan_proposed' and result.delivered
     assert result.plan.project_id == 'argos'
     assert len(result.plan.tasks) == 1 and len(prompts) == 3
     assert result.plan.tasks[0].state == TaskState.PLANNED
     assert 'EXTERNAL_CONTENT' in prompts[0]
-    assert store.list_tasks() == []  # #23 owns publishing/persisting the plan
+    assert len(store.list_tasks()) == 1  # issue #152: persisted pending confirmation, not yet materialized
 
 
 def test_unrecognized_text_falls_back_to_free_conversation_when_wired(store):
@@ -306,3 +308,113 @@ def test_human_gated_goal_keeps_real_planner_gate(store):
     result = route(store, 'Objetivo: Mudar billing do Argos para Pro', plan_fn=plan)
     assert result.kind == 'plan' and result.plan.needs_human_decision
     assert result.plan.tasks == []
+
+
+# --- issue #152: plan confirmation -------------------------------------------
+
+def _fake_planner(*tasks):
+    from orchestrator.planner import PlanResult
+    def planner(objective, **kwargs):
+        return PlanResult(project_id='hub', tasks=list(tasks))
+    return planner
+
+
+def test_a_plan_with_real_tasks_is_proposed_not_executed(store):
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    result = route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task),
+                   confirm_fn=lambda plan: pytest.fail('must not execute before confirmation'))
+    assert result.kind == 'plan_proposed'
+    assert 'Fazer X' in result.message
+    assert 'sim' in result.message.lower()
+
+
+def test_confirming_a_pending_plan_calls_confirm_fn_and_clears_it(store):
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    seen = []
+    def confirm(pending_plan):
+        seen.append(pending_plan)
+        return 'Executado de verdade.'
+
+    result = route(store, 'sim', plan_fn=no_planner, confirm_fn=confirm)
+    assert result.kind == 'plan_executed'
+    assert result.message == 'Executado de verdade.'
+    assert seen and seen[0]['objective'] == 'fazer X' and seen[0]['task_ids'] == [task.id]
+
+    # The confirmation is consumed - a second "sim" with nothing pending
+    # must not re-trigger confirm_fn.
+    second = route(store, 'sim', plan_fn=no_planner,
+                   confirm_fn=lambda plan: pytest.fail('must not run twice'))
+    assert second.kind == 'clarification'
+
+
+def test_cancelling_a_pending_plan_never_calls_confirm_fn(store):
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    result = route(store, 'nao', plan_fn=no_planner,
+                   confirm_fn=lambda plan: pytest.fail('must not execute a cancelled plan'))
+    assert result.kind == 'plan_cancelled'
+
+    # And confirming again afterward has nothing left to confirm.
+    again = route(store, 'sim', plan_fn=no_planner,
+                  confirm_fn=lambda plan: pytest.fail('must not run - plan was cancelled'))
+    assert again.kind == 'clarification'
+
+
+def test_pending_plan_takes_priority_over_an_unrelated_needs_lucas_decision(store):
+    # A NEEDS_LUCAS decision AND a pending plan can coexist - "sim" must
+    # resolve the more recent plan confirmation, not the older decision.
+    pending(store)
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    seen = []
+    result = route(store, 'sim', plan_fn=no_planner, confirm_fn=lambda p: (seen.append(p), 'ok')[1])
+
+    assert result.kind == 'plan_executed'
+    assert seen
+    # The unrelated NEEDS_LUCAS decision is untouched.
+    assert len(store.get_pending_decisions()) == 1
+
+
+def test_omitting_confirm_fn_never_executes_and_says_so(store):
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    result = route(store, 'sim', plan_fn=no_planner)  # no confirm_fn injected
+    assert result.kind == 'error'
+
+
+def test_confirm_fn_raising_never_leaks_and_the_plan_stays_pending_for_a_safe_retry(store):
+    # A failed confirm_fn (e.g. GitHub succeeded but Paperclip dispatch
+    # then raised) must NOT discard the plan - the SAME task_ids/
+    # correlation_ids need to survive so a second "sim" is a genuine,
+    # idempotent retry (materialize_plan's own correlation_id dedup,
+    # #17) rather than a fresh Objetivo: minting duplicate real Issues.
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    def boom(pending_plan):
+        raise RuntimeError('gh token=synthetic-secret')
+
+    result = route(store, 'sim', plan_fn=no_planner, confirm_fn=boom)
+    assert result.kind == 'error'
+    assert 'synthetic-secret' not in result.message
+
+    seen = []
+    again = route(store, 'sim', plan_fn=no_planner,
+                  confirm_fn=lambda p: (seen.append(p), 'ok')[1])
+    assert again.kind == 'plan_executed'
+    assert seen and seen[0]['task_ids'] == [task.id]
+
+
+def test_ambiguous_reply_while_a_plan_is_pending_asks_to_confirm_or_cancel(store):
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    result = route(store, 'e ai, funcionou?', plan_fn=no_planner,
+                   confirm_fn=lambda p: pytest.fail('must not execute an ambiguous reply'))
+    assert result.kind == 'clarification'
+    assert 'sim' in result.message.lower() and 'nao' in result.message.lower()

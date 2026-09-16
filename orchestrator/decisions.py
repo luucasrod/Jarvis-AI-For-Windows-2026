@@ -372,8 +372,80 @@ def _prioritize(store: Store, target: str) -> ControlResult:
     return store.run_in_transaction(apply)
 
 
-def _route_control(text: str, store: Store, plan_fn: Callable, fallback_fn: Callable | None = None) -> ControlResult:
+_PENDING_PLAN_KEY = "orchestrator:pending_plan_confirmation"
+_PLAN_CONFIRM_WORDS = re.compile(r'^(?:sim|confirmo|confirma|pode|manda|faz isso|isso mesmo)[.!]?$')
+_PLAN_CANCEL_WORDS = re.compile(r'^(?:nao|cancela|cancelar|esquece|deixa quieto)[.!]?$')
+
+
+def save_pending_plan(store: Store, *, objective: str, project_id: str | None, task_ids: list[str]) -> None:
+    """Persists the ONE outstanding plan awaiting the user's confirmation
+    (issue #152). Only reachable while NO plan is already pending -
+    `_route_control`'s pending-plan branch intercepts every message
+    (other than "sim"/"nao") while one is outstanding, so the user must
+    explicitly confirm or cancel the current proposal before a new
+    `Objetivo:` can reach this function. This is deliberate: replacing a
+    pending plan with a new one mid-flight would leave its
+    already-persisted PLANNED tasks silently orphaned with no path back
+    to materializing or explicitly discarding them."""
+    store.set_sync_value(_PENDING_PLAN_KEY, json.dumps({
+        "objective": objective, "project_id": project_id, "task_ids": task_ids,
+    }))
+
+
+def _load_pending_plan(store: Store) -> dict | None:
+    raw = store.get_sync_value(_PENDING_PLAN_KEY)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def _clear_pending_plan(store: Store) -> None:
+    store.set_sync_value(_PENDING_PLAN_KEY, "")
+
+
+def _route_control(
+    text: str, store: Store, plan_fn: Callable,
+    fallback_fn: Callable | None = None, confirm_fn: Callable | None = None,
+) -> ControlResult:
     normalized = _normalized(text)
+
+    # Issue #152: a pending plan (from a PRIOR "Objetivo:" that already
+    # got proposed but not yet confirmed) takes priority over everything
+    # else in this function - a bare "sim"/"nao" answers THAT, not a
+    # coincidentally-pending NEEDS_LUCAS decision, since it's the most
+    # recent thing this conversation was asked to confirm.
+    pending_plan = _load_pending_plan(store)
+    if pending_plan is not None:
+        if _PLAN_CONFIRM_WORDS.match(normalized):
+            if confirm_fn is None:
+                _clear_pending_plan(store)
+                return ControlResult('error', 'Nao ha um executor de planos configurado agora. O plano ficou sem efeito.')
+            try:
+                message = confirm_fn(pending_plan)
+            except Exception:
+                # Real GitHub/Paperclip errors can contain tokens/URLs.
+                # The pending plan is deliberately KEPT (not cleared) on
+                # failure - execute_confirmed_plan reuses the SAME
+                # already-persisted task_ids/correlation_ids on every
+                # call, so materialize_plan's own correlation_id-based
+                # idempotency (#17) makes a second "sim" a genuine safe
+                # retry, never a duplicate Issue, even if the first
+                # attempt partially succeeded (e.g. GitHub created but
+                # Paperclip dispatch then failed).
+                return ControlResult('error', 'Nao consegui executar o plano agora. Nenhuma tarefa foi perdida - responda "sim" de novo para tentar outra vez.')
+            _clear_pending_plan(store)
+            return ControlResult('plan_executed', message or 'Plano executado.')
+        if _PLAN_CANCEL_WORDS.match(normalized):
+            _clear_pending_plan(store)
+            return ControlResult('plan_cancelled', 'Cancelado, senhor. O plano nao foi executado.')
+        return ControlResult(
+            'clarification',
+            'Ha um plano aguardando confirmacao. Responda "sim" para executar ou "nao" para cancelar.',
+        )
+
     priority = re.match(r'^(?:prioriza|priorize|priorizar)\s+(?:a\s+)?(?:tarefa\s+)?(.+)$', text, re.IGNORECASE)
     if priority:
         return _prioritize(store, priority[1])
@@ -424,13 +496,36 @@ def _route_control(text: str, store: Store, plan_fn: Callable, fallback_fn: Call
         return ControlResult('error', 'Nao consegui gerar o plano agora. Tente novamente mais tarde.')
     if result.needs_human_decision:
         return ControlResult('plan', 'O planner identificou uma decisao humana necessaria; nenhuma tarefa foi iniciada.', plan=result)
-    return ControlResult('plan', f'Planejamento gerou {len(result.tasks)} tarefa(s).', plan=result)
+    if not result.tasks:
+        return ControlResult('plan', 'O planejamento nao gerou nenhuma tarefa.', plan=result)
+    # Issue #152: planning alone never touches GitHub/Paperclip - tasks
+    # are persisted (so they exist and can be inspected/cancelled even if
+    # the user never confirms) but nothing is materialized or dispatched
+    # until an explicit "sim" answers THIS proposal. Real Issues and real
+    # agent assignments are exactly the kind of hard-to-reverse, external
+    # action that needs the user's own confirmation, not an inferred one.
+    for task in result.tasks:
+        store.save_task(task)
+    save_pending_plan(
+        store, objective=objective, project_id=result.project_id,
+        task_ids=[task.id for task in result.tasks],
+    )
+    titles = "\n".join(f"- {task.title}" for task in result.tasks[:10])
+    extra = f"\n(e mais {len(result.tasks) - 10})" if len(result.tasks) > 10 else ""
+    return ControlResult(
+        'plan_proposed',
+        f"Plano para \"{objective}\" - {len(result.tasks)} tarefa(s):\n{titles}{extra}\n\n"
+        "Confirma, senhor? Responda \"sim\" para mandar pro GitHub e despachar pros agentes, "
+        "ou \"nao\" para cancelar.",
+        plan=result,
+    )
 
 
 def handle_control_message(text: str, *, store: Store | None = None,
                            plan_fn: Callable | None = None,
                            send_fn: Callable | None = None,
-                           fallback_fn: Callable | None = None) -> ControlResult:
+                           fallback_fn: Callable | None = None,
+                           confirm_fn: Callable | None = None) -> ControlResult:
     """Route text already authenticated by #19's control-chat filter.
 
     Return the plan to #23/runtime for persistence/dispatch. Decision replies
@@ -439,12 +534,17 @@ def handle_control_message(text: str, *, store: Store | None = None,
     Ambiguous text asks for clarification instead of guessing an action,
     unless `fallback_fn` (issue #149's free-conversation answer) is given -
     then it answers instead of just asking the sender to rephrase.
+
+    A successful "Objetivo:" plan is never materialized/dispatched here
+    directly - it is proposed and PERSISTED as pending, and only a later
+    "sim" (routed to `confirm_fn`, issue #152) actually creates real
+    GitHub Issues and assigns real Paperclip agents.
     """
     owned = store is None
     active_store = store if store is not None else Store()
     try:
         try:
-            result = (_route_control(text.strip(), active_store, plan_fn or plan, fallback_fn)
+            result = (_route_control(text.strip(), active_store, plan_fn or plan, fallback_fn, confirm_fn)
                       if isinstance(text, str) and text.strip() else
                       ControlResult('clarification', 'Envie um objetivo, resposta ou comando de prioridade em texto.'))
         except sqlite3.Error:
