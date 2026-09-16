@@ -138,6 +138,44 @@ def test_full_flow_creates_real_issue_and_assigns_real_agent(store, monkeypatch)
     assert "atribuida" in message.lower()
 
 
+def test_a_cancelled_plans_task_is_not_swept_into_a_later_confirmed_plan(store, monkeypatch):
+    # Review finding: `save_pending_plan` persists tasks as PLANNED before
+    # confirmation, so `decisions._discard_pending_plan_tasks` (triggered
+    # by "nao") must actually delete them - otherwise this end-to-end
+    # flow would resurrect a REJECTED task the moment ANY later plan for
+    # the same project is confirmed, since run_daily_cycle admits/
+    # dispatches every PLANNED/READY task project-wide, not just the
+    # just-confirmed task_ids.
+    import orchestrator.decisions as decisions
+
+    monkeypatch.setattr(
+        plan_confirmation.paperclip_client, "list_companies",
+        lambda: ([{"id": "acme-id", "name": "Hub"}], None),
+    )
+
+    rejected = _task(title="Rejeitada", state=TaskState.PLANNED, preferred_agent=AgentName.CLAUDE)
+    decisions.save_pending_plan(store, objective="rejeitada", project_id="hub", task_ids=[rejected.id])
+    store.save_task(rejected)
+    decisions._discard_pending_plan_tasks(store, decisions._load_pending_plan(store))
+    decisions._clear_pending_plan(store)
+    assert store.get_task(rejected.id) is None
+
+    confirmed = _task(title="Confirmada", state=TaskState.PLANNED, preferred_agent=AgentName.CLAUDE)
+    store.save_task(confirmed)
+
+    github = FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+    paperclip = FakePaperclipSession()
+
+    execute_confirmed_plan(
+        {"objective": "confirmada", "project_id": "hub", "task_ids": [confirmed.id]},
+        store=store, client=client, paperclip_session=paperclip, resolver=_FakeResolver(),
+    )
+
+    dispatched_titles = [post["title"] for post in github.posts]
+    assert dispatched_titles == ["Confirmada"]
+
+
 def test_no_tasks_never_touches_github_or_paperclip(store):
     message = execute_confirmed_plan(
         {"objective": "x", "project_id": "hub", "task_ids": []}, store=store,

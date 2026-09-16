@@ -406,6 +406,23 @@ def _clear_pending_plan(store: Store) -> None:
     store.set_sync_value(_PENDING_PLAN_KEY, "")
 
 
+def _discard_pending_plan_tasks(store: Store, pending_plan: dict) -> None:
+    """Deletes the PLANNED tasks a rejected/unexecutable pending plan
+    already persisted (`save_pending_plan` writes them to the tasks table
+    BEFORE confirmation, so `_route_control` can show their titles while
+    asking "sim"/"nao"). Without this, `_clear_pending_plan` only removes
+    the confirmation pointer - the tasks themselves stay PLANNED forever,
+    with nothing else in the codebase to prune them. Since
+    `execute_confirmed_plan` dispatches via `run_daily_cycle`, which
+    admits/dispatches every PLANNED/READY task for the whole project (not
+    just the just-confirmed task_ids), those orphans get silently swept
+    into the NEXT confirmed plan for the same project and dispatched for
+    real - creating a GitHub Issue and Paperclip assignment for a plan
+    the user explicitly said "nao" to (found in review)."""
+    for task_id in pending_plan.get("task_ids") or []:
+        store.delete_task(task_id)
+
+
 def _route_control(
     text: str, store: Store, plan_fn: Callable,
     fallback_fn: Callable | None = None, confirm_fn: Callable | None = None,
@@ -421,6 +438,7 @@ def _route_control(
     if pending_plan is not None:
         if _PLAN_CONFIRM_WORDS.match(normalized):
             if confirm_fn is None:
+                _discard_pending_plan_tasks(store, pending_plan)
                 _clear_pending_plan(store)
                 return ControlResult('error', 'Nao ha um executor de planos configurado agora. O plano ficou sem efeito.')
             try:
@@ -439,6 +457,7 @@ def _route_control(
             _clear_pending_plan(store)
             return ControlResult('plan_executed', message or 'Plano executado.')
         if _PLAN_CANCEL_WORDS.match(normalized):
+            _discard_pending_plan_tasks(store, pending_plan)
             _clear_pending_plan(store)
             return ControlResult('plan_cancelled', 'Cancelado, senhor. O plano nao foi executado.')
         return ControlResult(

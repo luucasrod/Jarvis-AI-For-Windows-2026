@@ -363,6 +363,22 @@ def test_cancelling_a_pending_plan_never_calls_confirm_fn(store):
     assert again.kind == 'clarification'
 
 
+def test_cancelling_a_pending_plan_discards_its_orphaned_tasks(store):
+    # Review finding: a cancelled plan's tasks were left PLANNED forever,
+    # with nothing to distinguish them from a LATER confirmed plan for
+    # the same project - run_daily_cycle admits/dispatches every PLANNED/
+    # READY task project-wide, so a rejected plan's tasks were silently
+    # dispatched for real once ANY later plan for that project was
+    # confirmed. Cancelling must remove them, not just the pointer.
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+    assert store.get_task(task.id) is not None
+
+    route(store, 'nao', plan_fn=no_planner)
+
+    assert store.get_task(task.id) is None
+
+
 def test_pending_plan_takes_priority_over_an_unrelated_needs_lucas_decision(store):
     # A NEEDS_LUCAS decision AND a pending plan can coexist - "sim" must
     # resolve the more recent plan confirmation, not the older decision.
@@ -385,6 +401,9 @@ def test_omitting_confirm_fn_never_executes_and_says_so(store):
 
     result = route(store, 'sim', plan_fn=no_planner)  # no confirm_fn injected
     assert result.kind == 'error'
+    # Same orphaning risk as an explicit "nao" - must not leave a PLANNED
+    # ghost task for a later confirmed plan to sweep up.
+    assert store.get_task(task.id) is None
 
 
 def test_confirm_fn_raising_never_leaks_and_the_plan_stays_pending_for_a_safe_retry(store):
