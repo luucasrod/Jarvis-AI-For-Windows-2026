@@ -376,6 +376,43 @@ _PENDING_PLAN_KEY = "orchestrator:pending_plan_confirmation"
 _PLAN_CONFIRM_WORDS = re.compile(r'^(?:sim|confirmo|confirma|pode|manda|faz isso|isso mesmo)[.!]?$')
 _PLAN_CANCEL_WORDS = re.compile(r'^(?:nao|cancela|cancelar|esquece|deixa quieto)[.!]?$')
 
+# Issue #154: once a plan reply is resolved (confirmed, cancelled, or
+# discarded for lack of confirm_fn) and the pending-plan pointer is
+# cleared, an immediate DUPLICATE of the SAME reply text (a Telegram
+# resend, a flaky retry, two poll-batch messages sent seconds apart by
+# the same human) falls straight through the now-empty pending-plan
+# branch into the bare sim/nao decision-answer grammar below - and can
+# silently approve/reject an unrelated NEEDS_LUCAS decision that
+# happened to be the only one pending, which was never the user's
+# intent. This records the last resolved reply's exact normalized text
+# and timestamp so an identical echo within a short window is caught
+# and named as a duplicate instead of being routed onward.
+_LAST_PLAN_REPLY_ECHO_KEY = "orchestrator:last_plan_reply_echo"
+_PLAN_REPLY_ECHO_WINDOW_SECONDS = 15
+
+
+def _record_plan_reply_echo(store: Store, normalized_text: str, *, now: datetime | None = None) -> None:
+    at = (now or datetime.now(timezone.utc)).isoformat()
+    store.set_sync_value(_LAST_PLAN_REPLY_ECHO_KEY, json.dumps({"text": normalized_text, "at": at}))
+
+
+def _is_duplicate_plan_reply_echo(store: Store, normalized_text: str, *, now: datetime | None = None) -> bool:
+    raw = store.get_sync_value(_LAST_PLAN_REPLY_ECHO_KEY)
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(data, dict) or data.get("text") != normalized_text:
+        return False
+    try:
+        resolved_at = datetime.fromisoformat(data.get("at", ""))
+    except (TypeError, ValueError):
+        return False
+    elapsed = ((now or datetime.now(timezone.utc)) - resolved_at).total_seconds()
+    return 0 <= elapsed <= _PLAN_REPLY_ECHO_WINDOW_SECONDS
+
 
 def save_pending_plan(store: Store, *, objective: str, project_id: str | None, task_ids: list[str]) -> None:
     """Persists the ONE outstanding plan awaiting the user's confirmation
@@ -392,7 +429,7 @@ def save_pending_plan(store: Store, *, objective: str, project_id: str | None, t
     }))
 
 
-def _load_pending_plan(store: Store) -> dict | None:
+def load_pending_plan(store: Store) -> dict | None:
     raw = store.get_sync_value(_PENDING_PLAN_KEY)
     if not raw:
         return None
@@ -434,12 +471,13 @@ def _route_control(
     # else in this function - a bare "sim"/"nao" answers THAT, not a
     # coincidentally-pending NEEDS_LUCAS decision, since it's the most
     # recent thing this conversation was asked to confirm.
-    pending_plan = _load_pending_plan(store)
+    pending_plan = load_pending_plan(store)
     if pending_plan is not None:
         if _PLAN_CONFIRM_WORDS.match(normalized):
             if confirm_fn is None:
                 _discard_pending_plan_tasks(store, pending_plan)
                 _clear_pending_plan(store)
+                _record_plan_reply_echo(store, normalized)
                 return ControlResult('error', 'Nao ha um executor de planos configurado agora. O plano ficou sem efeito.')
             try:
                 message = confirm_fn(pending_plan)
@@ -455,14 +493,30 @@ def _route_control(
                 # Paperclip dispatch then failed).
                 return ControlResult('error', 'Nao consegui executar o plano agora. Nenhuma tarefa foi perdida - responda "sim" de novo para tentar outra vez.')
             _clear_pending_plan(store)
+            _record_plan_reply_echo(store, normalized)
             return ControlResult('plan_executed', message or 'Plano executado.')
         if _PLAN_CANCEL_WORDS.match(normalized):
             _discard_pending_plan_tasks(store, pending_plan)
             _clear_pending_plan(store)
+            _record_plan_reply_echo(store, normalized)
             return ControlResult('plan_cancelled', 'Cancelado, senhor. O plano nao foi executado.')
         return ControlResult(
             'clarification',
             'Ha um plano aguardando confirmacao. Responda "sim" para executar ou "nao" para cancelar.',
+        )
+
+    # Issue #154: an identical "sim"/"nao" that arrives right after ONE OF
+    # THOSE SAME WORDS just resolved a plan confirmation/cancellation is
+    # almost certainly a duplicate echo (a Telegram resend, both messages
+    # of a flaky retry landing in the same poll batch) - not a fresh,
+    # separately-intended reply to whatever NEEDS_LUCAS decision happens
+    # to be pending now. Routing it onward could silently approve/reject
+    # a decision the user never meant to touch (found in review).
+    if _is_duplicate_plan_reply_echo(store, normalized):
+        return ControlResult(
+            'duplicate_ignored',
+            'Ja processei essa confirmacao, senhor - nada foi feito de novo. '
+            'Se quiser responder a outra coisa pendente, use REF: <referencia> <resposta>.',
         )
 
     priority = re.match(r'^(?:prioriza|priorize|priorizar)\s+(?:a\s+)?(?:tarefa\s+)?(.+)$', text, re.IGNORECASE)

@@ -271,3 +271,41 @@ def test_report_tick_is_ticked_every_iteration(store, monkeypatch):
     run_forever(store=store, config=_CONFIGURED, iterations=2, poll_interval_seconds=0, get_fn=fake_get)
 
     assert len(calls) == 2
+
+
+def test_paperclip_sync_tick_is_ticked_every_iteration(store, monkeypatch):
+    # Issue #157: the loop must also drive process_paperclip_sync_tick,
+    # not just the report tick - otherwise a dependent task can never
+    # unblock without someone manually re-running the dispatch.
+    calls = []
+    monkeypatch.setattr(
+        "orchestrator.runtime.process_paperclip_sync_tick",
+        lambda store, **kwargs: calls.append(kwargs.get("config")),
+    )
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {"result": []})
+
+    run_forever(store=store, config=_CONFIGURED, iterations=2, poll_interval_seconds=0, get_fn=fake_get)
+
+    assert len(calls) == 2
+
+
+def test_paperclip_sync_tick_failure_does_not_stop_the_loop(store, monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.runtime.process_paperclip_sync_tick",
+        lambda store, **kwargs: (_ for _ in ()).throw(RuntimeError("paperclip offline")),
+    )
+
+    def fake_get(url, params, timeout):
+        return _FakeResponse(200, {"result": []})
+
+    calls = []
+    monkeypatch.setattr(
+        "orchestrator.runtime.process_report_tick",
+        lambda store, **kwargs: calls.append(True),
+    )
+    # Must not raise, and the report tick (which runs right before it)
+    # must still be reached every iteration.
+    run_forever(store=store, config=_CONFIGURED, iterations=2, poll_interval_seconds=0, get_fn=fake_get)
+    assert len(calls) == 2

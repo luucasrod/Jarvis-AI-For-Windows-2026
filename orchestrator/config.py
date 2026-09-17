@@ -32,6 +32,11 @@ _DEFAULT_TELEGRAM_SEND_TIMEOUT_SECONDS = 10.0
 _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 15.0
 _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 120.0
 _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS = 172800.0
+# #157: how often the runtime loop checks dispatched tasks for real
+# Paperclip completion. A poll every ~3s (the loop's own default cadence)
+# would hammer Paperclip's API for no benefit - real agent work takes
+# minutes, not seconds.
+_DEFAULT_PAPERCLIP_SYNC_INTERVAL_SECONDS = 60.0
 # #148: same Groq account/model main.py's own take_command() already uses
 # for local voice transcription (whisper-large-v3-turbo) - reused here so
 # a voice message sent to the Telegram control channel transcribes the
@@ -112,6 +117,7 @@ class OrchestratorConfig:
     telegram_health_max_age_seconds: float = _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS
     groq_api_key: str | None = field(default=None)
     groq_transcribe_model: str = _DEFAULT_GROQ_TRANSCRIBE_MODEL
+    paperclip_sync_interval_seconds: float = _DEFAULT_PAPERCLIP_SYNC_INTERVAL_SECONDS
 
 
 def load_config() -> OrchestratorConfig:
@@ -161,6 +167,9 @@ def load_config() -> OrchestratorConfig:
         ),
         groq_api_key=_get("GROQ_API_KEY"),
         groq_transcribe_model=_get("GROQ_TRANSCRIBE_MODEL", _DEFAULT_GROQ_TRANSCRIBE_MODEL),
+        paperclip_sync_interval_seconds=_get_seconds(
+            "PAPERCLIP_SYNC_INTERVAL_SECONDS", _DEFAULT_PAPERCLIP_SYNC_INTERVAL_SECONDS
+        ),
     )
 
 
@@ -191,6 +200,7 @@ def validate_config(config: OrchestratorConfig | None = None) -> list[str]:
         ("TELEGRAM_POLL_TIMEOUT_SECONDS", _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
         ("HEARTBEAT_MAX_AGE_SECONDS", _DEFAULT_HEARTBEAT_MAX_AGE_SECONDS),
         ("TELEGRAM_HEALTH_MAX_AGE_SECONDS", _DEFAULT_TELEGRAM_HEALTH_MAX_AGE_SECONDS),
+        ("PAPERCLIP_SYNC_INTERVAL_SECONDS", _DEFAULT_PAPERCLIP_SYNC_INTERVAL_SECONDS),
     ):
         raw = _get(name)
         if raw is not None and _positive_seconds(raw) is None:

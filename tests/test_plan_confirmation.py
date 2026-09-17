@@ -10,7 +10,7 @@ from orchestrator.github_client import GitHubClient
 from orchestrator.models import AgentClass, AgentName, ExecutionMode, Task, TaskState
 from orchestrator.paperclip_ops import PaperclipSession
 from orchestrator.persistence import Store
-from orchestrator.plan_confirmation import _resolve_company_id, execute_confirmed_plan
+from orchestrator.plan_confirmation import resolve_company_id, execute_confirmed_plan
 from orchestrator.project_resolver import ProjectContext
 
 PROJECT = ProjectContext(
@@ -88,29 +88,29 @@ def _patch_find_agent(monkeypatch):
     monkeypatch.setattr("orchestrator.orchestrator.paperclip_client.find_agent", _fake_find_agent)
 
 
-# --- _resolve_company_id ------------------------------------------------------
+# --- resolve_company_id ------------------------------------------------------
 
-def test_resolve_company_id_exact_match(monkeypatch):
+def testresolve_company_id_exact_match(monkeypatch):
     monkeypatch.setattr(
         plan_confirmation.paperclip_client, "list_companies",
         lambda: ([{"id": "acme-id", "name": "Hub"}], None),
     )
-    assert _resolve_company_id(PROJECT, OrchestratorConfig()) == "acme-id"
+    assert resolve_company_id(PROJECT, OrchestratorConfig()) == "acme-id"
 
 
-def test_resolve_company_id_never_matches_near_homonym(monkeypatch):
+def testresolve_company_id_never_matches_near_homonym(monkeypatch):
     # "hub" must never match "Hub-Extra" - same reasoning as #149's
     # voice_facade (Argos vs Argos-Hub).
     monkeypatch.setattr(
         plan_confirmation.paperclip_client, "list_companies",
         lambda: ([{"id": "wrong-id", "name": "Hub-Extra"}], None),
     )
-    assert _resolve_company_id(PROJECT, OrchestratorConfig()) is None
+    assert resolve_company_id(PROJECT, OrchestratorConfig()) is None
 
 
-def test_resolve_company_id_returns_none_on_paperclip_error(monkeypatch):
+def testresolve_company_id_returns_none_on_paperclip_error(monkeypatch):
     monkeypatch.setattr(plan_confirmation.paperclip_client, "list_companies", lambda: ([], "offline"))
-    assert _resolve_company_id(PROJECT, OrchestratorConfig()) is None
+    assert resolve_company_id(PROJECT, OrchestratorConfig()) is None
 
 
 # --- execute_confirmed_plan ----------------------------------------------------
@@ -138,6 +138,39 @@ def test_full_flow_creates_real_issue_and_assigns_real_agent(store, monkeypatch)
     assert "atribuida" in message.lower()
 
 
+def test_execute_confirmed_plan_still_admits_its_own_tasks_while_its_pending_plan_pointer_is_still_set(store, monkeypatch):
+    # Issue #158 fix in orchestrator.py: run_daily_cycle now refuses to
+    # admit any task still sitting in the CURRENT pending plan, to stop
+    # an unconfirmed plan being swept into an unrelated resync (#157).
+    # But decisions._route_control only clears that pointer AFTER
+    # confirm_fn (execute_confirmed_plan) returns - so at the moment
+    # THIS call runs, the pointer is still pointing at these EXACT
+    # task_ids. Without the confirmed_task_ids allowlist, a plan would
+    # block its own first-ever confirmation.
+    import orchestrator.decisions as decisions
+
+    monkeypatch.setattr(
+        plan_confirmation.paperclip_client, "list_companies",
+        lambda: ([{"id": "acme-id", "name": "Hub"}], None),
+    )
+    task = _task(state=TaskState.PLANNED, preferred_agent=AgentName.CLAUDE)
+    store.save_task(task)
+    decisions.save_pending_plan(store, objective="criar tela", project_id="hub", task_ids=[task.id])
+
+    github = FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+    paperclip = FakePaperclipSession()
+
+    message = execute_confirmed_plan(
+        decisions.load_pending_plan(store),
+        store=store, client=client, paperclip_session=paperclip, resolver=_FakeResolver(),
+    )
+
+    assert len(github.posts) == 1
+    assert len(paperclip.created) == 1
+    assert "Issues criadas" in message
+
+
 def test_a_cancelled_plans_task_is_not_swept_into_a_later_confirmed_plan(store, monkeypatch):
     # Review finding: `save_pending_plan` persists tasks as PLANNED before
     # confirmation, so `decisions._discard_pending_plan_tasks` (triggered
@@ -156,7 +189,7 @@ def test_a_cancelled_plans_task_is_not_swept_into_a_later_confirmed_plan(store, 
     rejected = _task(title="Rejeitada", state=TaskState.PLANNED, preferred_agent=AgentName.CLAUDE)
     decisions.save_pending_plan(store, objective="rejeitada", project_id="hub", task_ids=[rejected.id])
     store.save_task(rejected)
-    decisions._discard_pending_plan_tasks(store, decisions._load_pending_plan(store))
+    decisions._discard_pending_plan_tasks(store, decisions.load_pending_plan(store))
     decisions._clear_pending_plan(store)
     assert store.get_task(rejected.id) is None
 
@@ -241,9 +274,9 @@ def test_no_matching_paperclip_company_still_publishes_to_github(store, monkeypa
     assert "nenhum agente foi acionado" in message.lower()
 
 
-def test_admission_window_clock_is_inside_the_configured_window():
+def testadmission_window_clock_is_inside_the_configured_window():
     cfg = OrchestratorConfig(timezone="UTC", cycle_start_time="08:00", cutoff_time="14:00")
-    clock = plan_confirmation._admission_window_clock(cfg)
+    clock = plan_confirmation.admission_window_clock(cfg)
     instant = clock()
     from datetime import time
     assert time(8, 0) <= instant.time() < time(14, 0)
@@ -252,18 +285,18 @@ def test_admission_window_clock_is_inside_the_configured_window():
     assert clock() == instant
 
 
-def test_admission_window_clock_stays_inside_a_narrow_window():
+def testadmission_window_clock_stays_inside_a_narrow_window():
     # Independent-review finding: a naive "+30 minutes" could overshoot a
     # narrow/custom window entirely, silently dispatching nothing while
     # claiming success. A 15-minute window's midpoint must still land
     # strictly before cutoff.
     from datetime import time
     cfg = OrchestratorConfig(timezone="UTC", cycle_start_time="08:00", cutoff_time="08:15")
-    clock = plan_confirmation._admission_window_clock(cfg)
+    clock = plan_confirmation.admission_window_clock(cfg)
     instant = clock()
     assert time(8, 0) <= instant.time() < time(8, 15)
 
 
-def test_admission_window_clock_returns_none_for_an_impossible_window():
+def testadmission_window_clock_returns_none_for_an_impossible_window():
     cfg = OrchestratorConfig(timezone="UTC", cycle_start_time="14:00", cutoff_time="08:00")
-    assert plan_confirmation._admission_window_clock(cfg) is None
+    assert plan_confirmation.admission_window_clock(cfg) is None
