@@ -135,6 +135,14 @@ def execute_confirmed_plan(
         client=client or GitHubClient(store, config=cfg),
         paperclip_session=paperclip_session, company_id=company_id,
         clock=clock, config=cfg,
+        # Issue #158: run_daily_cycle otherwise blocks admission for any
+        # task still sitting in the CURRENT pending plan - true for this
+        # plan's own tasks too, since decisions._route_control only
+        # clears the pointer AFTER this call returns (deliberately, for
+        # a safe retry on failure). This explicit allowlist is the one
+        # exception: exactly the task_ids THIS confirmation is for, and
+        # nothing else.
+        confirmed_task_ids=frozenset(task_ids),
     )
 
     # Never opens with a claim of success (independent-review finding):

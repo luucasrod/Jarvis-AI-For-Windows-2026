@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 import paperclip_client
 from orchestrator.agent_availability import is_agent_available
 from orchestrator.config import OrchestratorConfig, load_config
-from orchestrator.decisions import get_priority_queue
+from orchestrator.decisions import get_priority_queue, load_pending_plan
 from orchestrator.github_client import GitHubClient
 from orchestrator.healthcheck import IdleDiagnosis, check_idle
 from orchestrator.history import diff_since
@@ -282,6 +282,7 @@ def run_daily_cycle(
     config: OrchestratorConfig | None = None,
     paperclip_available: Callable[[], bool] | None = None,
     paperclip_snapshot: Callable[[], dict] | None = None,
+    confirmed_task_ids: frozenset[str] | None = None,
 ) -> DailyCycleResult:
     """Runs one daily-cycle pass for `project_context` specifically:
     reconsiders eligible queued tasks through the Scheduler's own
@@ -378,7 +379,31 @@ def run_daily_cycle(
     ready_before = {task.id for task in store.list_tasks(TaskState.READY)}
     cycle_fired = scheduler.on_cycle_start()
 
+    # Issue #158 finding: save_pending_plan (#152) persists a PROPOSED
+    # plan's tasks as PLANNED before the human ever answers "sim" - so
+    # the store-wide scan below, with no project/confirmation filter of
+    # its own, would otherwise admit (and, once #157's periodic sync
+    # re-runs this same function for that project, actually DISPATCH -
+    # real GitHub Issue, real Paperclip agent) a plan nobody has
+    # confirmed yet, the moment any OTHER already-confirmed task in the
+    # same project finishes. A task still sitting in the current pending
+    # plan's task_ids is never eligible for admission UNLESS this very
+    # call is the one confirming it (`confirmed_task_ids`, set only by
+    # `execute_confirmed_plan` - see plan_confirmation.py). The pending
+    # plan pointer is deliberately still set at that exact moment (it is
+    # only cleared by `_route_control` AFTER `confirm_fn` returns, so a
+    # failure mid-dispatch leaves it intact for a safe retry) - without
+    # this explicit allowlist, a plan's own first confirmation would
+    # block its own tasks from ever admitting.
+    pending_plan = load_pending_plan(store)
+    unconfirmed_task_ids = (
+        frozenset(pending_plan.get("task_ids") or []) - (confirmed_task_ids or frozenset())
+        if pending_plan else frozenset()
+    )
+
     for task in get_priority_queue(store):
+        if task.id in unconfirmed_task_ids:
+            continue
         if task.state == TaskState.PLANNED:
             scheduler.admit_task(task)
         elif task.state == TaskState.NEXT_CYCLE:

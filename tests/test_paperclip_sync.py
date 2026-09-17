@@ -192,6 +192,48 @@ def test_done_task_is_marked_done_and_its_project_is_redispatched(store, monkeyp
     assert github.posts[0]["title"] == "Dependent task"
 
 
+def test_an_unconfirmed_pending_plan_in_the_same_project_is_never_swept_into_dispatch(store, monkeypatch):
+    # Independent-review finding on this PR: save_pending_plan (#152)
+    # persists a proposed plan's tasks as PLANNED before the human ever
+    # answers "sim". Before the orchestrator.py fix, a resync triggered
+    # by an UNRELATED, already-confirmed task finishing in the SAME
+    # project would admit and dispatch the still-unconfirmed plan too -
+    # a real GitHub Issue and Paperclip assignment for work nobody
+    # approved. Reproduces that exact scenario end-to-end and asserts
+    # it no longer happens.
+    import orchestrator.decisions as decisions
+
+    confirmed = _task(title="Ja confirmada", state=TaskState.READY)
+    store.save_task(confirmed)
+
+    unconfirmed = _task(title="NAO CONFIRMADA - nao deve ser despachada", state=TaskState.PLANNED)
+    store.save_task(unconfirmed)
+    decisions.save_pending_plan(
+        store, objective="outro pedido ainda nao confirmado",
+        project_id="hub", task_ids=[unconfirmed.id],
+    )
+
+    monkeypatch.setattr(paperclip_sync, "resolve_company_id", lambda project, config: "company-1")
+    monkeypatch.setattr(paperclip_sync, "find_created_task_id",
+                        lambda company_id, correlation_id, **k: "pc-1" if correlation_id == confirmed.correlation_id else None)
+    monkeypatch.setattr(paperclip_sync, "get_task_status", lambda *a, **k: {"available": True, "status": "done"})
+
+    github = FakeGitHub()
+    client = GitHubClient(store, run_fn=github.run, timeout_seconds=5)
+
+    result = sync_dispatched_tasks(
+        store, resolver=_FakeResolver(), client=client, paperclip_session_factory=FakePaperclipSession,
+    )
+
+    assert result["synced_task_ids"] == [confirmed.id]
+    assert store.get_task(unconfirmed.id).state == TaskState.PLANNED
+    assert all("NAO CONFIRMADA" not in post.get("title", "") for post in github.posts)
+    # The pending plan itself must still be there, untouched, waiting
+    # for its own explicit "sim"/"nao".
+    still_pending = decisions.load_pending_plan(store)
+    assert still_pending is not None and still_pending["task_ids"] == [unconfirmed.id]
+
+
 def test_multiple_done_tasks_in_the_same_project_only_redispatch_once(store, monkeypatch):
     first = _task(title="First", state=TaskState.READY)
     second = _task(title="Second", state=TaskState.READY)

@@ -429,7 +429,7 @@ def save_pending_plan(store: Store, *, objective: str, project_id: str | None, t
     }))
 
 
-def _load_pending_plan(store: Store) -> dict | None:
+def load_pending_plan(store: Store) -> dict | None:
     raw = store.get_sync_value(_PENDING_PLAN_KEY)
     if not raw:
         return None
@@ -471,7 +471,7 @@ def _route_control(
     # else in this function - a bare "sim"/"nao" answers THAT, not a
     # coincidentally-pending NEEDS_LUCAS decision, since it's the most
     # recent thing this conversation was asked to confirm.
-    pending_plan = _load_pending_plan(store)
+    pending_plan = load_pending_plan(store)
     if pending_plan is not None:
         if _PLAN_CONFIRM_WORDS.match(normalized):
             if confirm_fn is None:
