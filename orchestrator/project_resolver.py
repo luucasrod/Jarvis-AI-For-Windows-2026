@@ -206,7 +206,17 @@ class ProjectResolver:
         return ProjectContext(
             canonical_id=canonical_id,
             root=project.get("root"),
-            repository=project.get("repository") or project.get("repository_owner_repo"),
+            # repository_owner_repo (the "owner/repo" form GitHubClient's
+            # strict _repo() validator requires) must win over repository
+            # (a free-text URL/description, e.g. "https://github.com/x/y.git"
+            # or "https://github.com/x/y (private, branch master, ...)") -
+            # every real consumer (task_queue.materialize_plan,
+            # deploy_watch) feeds this straight into GitHubClient, which
+            # rejects anything that isn't exactly owner/repo. Picking the
+            # URL first made materialize_plan silently create zero GitHub
+            # Issues and zero dispatches for every project in the index
+            # (found live testing issue #152 - #155).
+            repository=project.get("repository_owner_repo") or project.get("repository"),
             primary_context=project.get("primary_context"),
             always_read=list(project.get("always_read") or []),
             conditional_context=list(project.get("conditional_context") or []),

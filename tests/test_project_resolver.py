@@ -27,6 +27,8 @@ _SAMPLE_INDEX = {
         },
         "masya_growth_agent": {
             "root": "A:\\masya-growth-agent",
+            "repository": "https://github.com/luucasrod/masya-growth-agent.git",
+            "repository_owner_repo": "luucasrod/masya-growth-agent",
         },
         # 'jarvis' intentionally has NO 'projects' entry to test the
         # inconsistent-index case.
@@ -46,6 +48,24 @@ def test_resolve_by_canonical_id(tmp_path):
     assert isinstance(result, ProjectContext)
     assert result.canonical_id == "argos_hub"
     assert result.root == "A:\\Argos-Hub"
+
+
+def test_repository_owner_repo_wins_over_full_url(tmp_path):
+    # Issue #155: when an index entry has BOTH fields, GitHubClient's
+    # strict owner/repo validator rejects the full URL outright - every
+    # real caller (materialize_plan, deploy_watch) feeds .repository
+    # straight into it, so the owner/repo form must always win.
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("masya_growth_agent")
+    assert isinstance(result, ProjectContext)
+    assert result.repository == "luucasrod/masya-growth-agent"
+
+
+def test_repository_url_is_still_used_when_owner_repo_is_absent(tmp_path):
+    index_path = _write_index(tmp_path)
+    result = ProjectResolver(str(index_path)).resolve("wd_pdr")
+    assert isinstance(result, ProjectContext)
+    assert result.repository == "https://github.com/luucasrod/wd-pdr-quote.git"
 
 
 def test_resolve_by_alias_case_insensitive(tmp_path):
