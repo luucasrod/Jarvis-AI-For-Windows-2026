@@ -10,7 +10,7 @@ from orchestrator.github_client import GitHubClient
 from orchestrator.models import AgentClass, AgentName, ExecutionMode, Task, TaskState
 from orchestrator.paperclip_ops import PaperclipSession
 from orchestrator.persistence import Store
-from orchestrator.plan_confirmation import _resolve_company_id, execute_confirmed_plan
+from orchestrator.plan_confirmation import resolve_company_id, execute_confirmed_plan
 from orchestrator.project_resolver import ProjectContext
 
 PROJECT = ProjectContext(
@@ -88,29 +88,29 @@ def _patch_find_agent(monkeypatch):
     monkeypatch.setattr("orchestrator.orchestrator.paperclip_client.find_agent", _fake_find_agent)
 
 
-# --- _resolve_company_id ------------------------------------------------------
+# --- resolve_company_id ------------------------------------------------------
 
-def test_resolve_company_id_exact_match(monkeypatch):
+def testresolve_company_id_exact_match(monkeypatch):
     monkeypatch.setattr(
         plan_confirmation.paperclip_client, "list_companies",
         lambda: ([{"id": "acme-id", "name": "Hub"}], None),
     )
-    assert _resolve_company_id(PROJECT, OrchestratorConfig()) == "acme-id"
+    assert resolve_company_id(PROJECT, OrchestratorConfig()) == "acme-id"
 
 
-def test_resolve_company_id_never_matches_near_homonym(monkeypatch):
+def testresolve_company_id_never_matches_near_homonym(monkeypatch):
     # "hub" must never match "Hub-Extra" - same reasoning as #149's
     # voice_facade (Argos vs Argos-Hub).
     monkeypatch.setattr(
         plan_confirmation.paperclip_client, "list_companies",
         lambda: ([{"id": "wrong-id", "name": "Hub-Extra"}], None),
     )
-    assert _resolve_company_id(PROJECT, OrchestratorConfig()) is None
+    assert resolve_company_id(PROJECT, OrchestratorConfig()) is None
 
 
-def test_resolve_company_id_returns_none_on_paperclip_error(monkeypatch):
+def testresolve_company_id_returns_none_on_paperclip_error(monkeypatch):
     monkeypatch.setattr(plan_confirmation.paperclip_client, "list_companies", lambda: ([], "offline"))
-    assert _resolve_company_id(PROJECT, OrchestratorConfig()) is None
+    assert resolve_company_id(PROJECT, OrchestratorConfig()) is None
 
 
 # --- execute_confirmed_plan ----------------------------------------------------
@@ -241,9 +241,9 @@ def test_no_matching_paperclip_company_still_publishes_to_github(store, monkeypa
     assert "nenhum agente foi acionado" in message.lower()
 
 
-def test_admission_window_clock_is_inside_the_configured_window():
+def testadmission_window_clock_is_inside_the_configured_window():
     cfg = OrchestratorConfig(timezone="UTC", cycle_start_time="08:00", cutoff_time="14:00")
-    clock = plan_confirmation._admission_window_clock(cfg)
+    clock = plan_confirmation.admission_window_clock(cfg)
     instant = clock()
     from datetime import time
     assert time(8, 0) <= instant.time() < time(14, 0)
@@ -252,18 +252,18 @@ def test_admission_window_clock_is_inside_the_configured_window():
     assert clock() == instant
 
 
-def test_admission_window_clock_stays_inside_a_narrow_window():
+def testadmission_window_clock_stays_inside_a_narrow_window():
     # Independent-review finding: a naive "+30 minutes" could overshoot a
     # narrow/custom window entirely, silently dispatching nothing while
     # claiming success. A 15-minute window's midpoint must still land
     # strictly before cutoff.
     from datetime import time
     cfg = OrchestratorConfig(timezone="UTC", cycle_start_time="08:00", cutoff_time="08:15")
-    clock = plan_confirmation._admission_window_clock(cfg)
+    clock = plan_confirmation.admission_window_clock(cfg)
     instant = clock()
     assert time(8, 0) <= instant.time() < time(8, 15)
 
 
-def test_admission_window_clock_returns_none_for_an_impossible_window():
+def testadmission_window_clock_returns_none_for_an_impossible_window():
     cfg = OrchestratorConfig(timezone="UTC", cycle_start_time="14:00", cutoff_time="08:00")
-    assert plan_confirmation._admission_window_clock(cfg) is None
+    assert plan_confirmation.admission_window_clock(cfg) is None

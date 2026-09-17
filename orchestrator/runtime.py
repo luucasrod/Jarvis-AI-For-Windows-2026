@@ -13,7 +13,12 @@ human ran a one-off script by hand for that single message.
 Real GitHub/Paperclip dispatch (issue #152) is wired in too, but ONLY
 behind the user's own explicit "sim" confirming a specific proposed plan
 - see decisions.py's `confirm_fn` contract and plan_confirmation.py's
-`execute_confirmed_plan`. This loop never dispatches anything on its own.
+`execute_confirmed_plan`. This loop never dispatches anything ON ITS OWN
+INITIATIVE. Once a plan IS confirmed and dispatched, though, its
+DEPENDENT tasks progress fully unattended: #157's `process_paperclip_sync_tick`
+notices real Paperclip completions and re-runs the same confirmed
+dispatch path for whatever just unblocked - the human only approves the
+plan once, not every layer of it.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.conversation import answer_free_text
 from orchestrator.decisions import handle_control_message
 from orchestrator.events import EventType, query_events
+from orchestrator.paperclip_sync import process_paperclip_sync_tick
 from orchestrator.persistence import Store
 from orchestrator.plan_confirmation import execute_confirmed_plan
 from orchestrator.reporting import process_report_tick
@@ -130,6 +136,14 @@ def run_forever(
                 process_report_tick(active_store, config=cfg, send_fn=report_send_fn)
             except Exception:
                 _LOGGER.exception("Falha ao processar o relatorio diario")
+
+            try:
+                # Issue #157: notices real Paperclip completions and lets
+                # tasks blocked ONLY on them admit/dispatch for real -
+                # self-throttled internally, safe to call every iteration.
+                process_paperclip_sync_tick(active_store, config=cfg)
+            except Exception:
+                _LOGGER.exception("Falha ao sincronizar conclusoes do Paperclip")
 
             count += 1
             if iterations is None or count < iterations:

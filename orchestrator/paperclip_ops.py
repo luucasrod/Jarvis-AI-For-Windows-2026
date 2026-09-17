@@ -234,6 +234,36 @@ def create_task_idempotent(
             store.close()
 
 
+def find_created_task_id(
+    company_id: str, correlation_id: str, *, store: Store, config: OrchestratorConfig | None = None,
+) -> str | None:
+    """Looks up the remote Paperclip task id already created for this
+    (server, company_id, correlation_id) triple via a PAST
+    `create_task_idempotent` call - never attempts a new creation, never
+    makes a network call. Returns None whenever nothing was ever
+    created (wrong/rotated server, never dispatched, or a lookup
+    failure) so a caller (issue #157's sync tick) can call this freely
+    on every locally-tracked task without special-casing "not
+    dispatched yet" versus "dispatched but not found"."""
+    if not all(isinstance(value, str) and value.strip() for value in (company_id, correlation_id)):
+        return None
+    cfg = config or load_config()
+    key = _digest([cfg.paperclip_base_url.rstrip('/'), company_id, correlation_id])
+    try:
+        store.ensure_schema(_SCHEMA)
+        rows = store.query('SELECT result FROM paperclip_creations WHERE operation_key = ?', (key,))
+    except sqlite3.Error:
+        return None
+    if not rows or rows[0][0] is None:
+        return None
+    try:
+        remote = json.loads(rows[0][0])
+    except (ValueError, TypeError):
+        return None
+    task_id = remote.get('id') if isinstance(remote, dict) else None
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
 def get_task_status(company_id: str, task_id: str, *, config: OrchestratorConfig | None = None) -> dict:
     """Read an exact task ID through the company-scoped list endpoint."""
     if not all(isinstance(value, str) and value.strip() for value in (company_id, task_id)):

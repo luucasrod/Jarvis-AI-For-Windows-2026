@@ -42,7 +42,7 @@ def _normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.strip().lower())
 
 
-def _resolve_company_id(project: ProjectContext, config: OrchestratorConfig) -> str | None:
+def resolve_company_id(project: ProjectContext, config: OrchestratorConfig) -> str | None:
     companies, err = paperclip_client.list_companies()
     if err:
         return None
@@ -53,7 +53,7 @@ def _resolve_company_id(project: ProjectContext, config: OrchestratorConfig) -> 
     return None
 
 
-def _admission_window_clock(config: OrchestratorConfig):
+def admission_window_clock(config: OrchestratorConfig):
     """A real-time, user-confirmed "sim" is its own authorization to
     start now - it does not need to wait for the automatic daily cycle's
     own pacing window (default 08:00-14:00), which exists to spread
@@ -117,7 +117,7 @@ def execute_confirmed_plan(
         return _NO_PROJECT.format(project_id=project_id)
     project = resolved
 
-    clock = _admission_window_clock(cfg)
+    clock = admission_window_clock(cfg)
     if clock is None:
         return (
             f"CYCLE_START_TIME/CUTOFF_TIME estao configurados de um jeito que nao deixa nenhum horario "
@@ -126,7 +126,7 @@ def execute_confirmed_plan(
             "configuracao e responda \"sim\" de novo."
         )
 
-    company_id = _resolve_company_id(project, cfg)
+    company_id = resolve_company_id(project, cfg)
     if paperclip_session is None and company_id:
         paperclip_session = PaperclipSession(config=cfg)
 

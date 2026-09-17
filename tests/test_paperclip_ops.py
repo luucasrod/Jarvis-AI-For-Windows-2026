@@ -9,7 +9,7 @@ import requests
 
 import paperclip_client as client
 from orchestrator.config import OrchestratorConfig
-from orchestrator.paperclip_ops import create_task_idempotent, get_task_status
+from orchestrator.paperclip_ops import create_task_idempotent, find_created_task_id, get_task_status
 from orchestrator.persistence import Store
 
 CONFIG = OrchestratorConfig(paperclip_base_url='http://paperclip.invalid', paperclip_timeout_seconds=2.5)
@@ -217,6 +217,36 @@ def test_invalid_created_payload_is_uncertain(store, transport, monkeypatch):
     monkeypatch.setattr(client.requests, 'post', lambda *args, **kwargs: Response([], 201))
     assert create(store)['reason'] == 'invalid_created_task'
     assert create(store)['reason'] == 'creation_unconfirmed'
+
+
+# --- find_created_task_id (issue #157) -----------------------------------------
+
+def test_find_created_task_id_returns_none_before_any_creation(store, transport):
+    assert find_created_task_id('company', 'corr', store=store, config=CONFIG) is None
+    assert transport.gets == [] and transport.posts == []  # never touches the network
+
+
+def test_find_created_task_id_returns_the_id_after_creation(store, transport):
+    result = create(store)
+    assert find_created_task_id('company', 'corr', store=store, config=CONFIG) == result['task_id']
+
+
+def test_find_created_task_id_is_scoped_to_company_and_correlation(store, transport):
+    create(store)
+    assert find_created_task_id('other-company', 'corr', store=store, config=CONFIG) is None
+    assert find_created_task_id('company', 'other-corr', store=store, config=CONFIG) is None
+
+
+def test_find_created_task_id_never_raises_on_invalid_input(store, transport):
+    assert find_created_task_id('', 'corr', store=store, config=CONFIG) is None
+    assert find_created_task_id('company', '', store=store, config=CONFIG) is None
+    assert find_created_task_id(None, 'corr', store=store, config=CONFIG) is None
+
+
+def test_find_created_task_id_returns_none_on_local_persistence_error(store, transport, monkeypatch):
+    create(store)
+    monkeypatch.setattr(store, 'query', lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError('locked')))
+    assert find_created_task_id('company', 'corr', store=store, config=CONFIG) is None
 
 
 def test_pagination_and_encoded_company_id(monkeypatch):

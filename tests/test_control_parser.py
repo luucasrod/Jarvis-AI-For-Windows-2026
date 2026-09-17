@@ -342,11 +342,13 @@ def test_confirming_a_pending_plan_calls_confirm_fn_and_clears_it(store):
     assert result.message == 'Executado de verdade.'
     assert seen and seen[0]['objective'] == 'fazer X' and seen[0]['task_ids'] == [task.id]
 
-    # The confirmation is consumed - a second "sim" with nothing pending
-    # must not re-trigger confirm_fn.
+    # The confirmation is consumed - a second, identical "sim" right after
+    # must not re-trigger confirm_fn. Issue #154: this is now recognized
+    # as a duplicate echo of the reply that just resolved the plan,
+    # rather than falling through to a generic "didn't understand".
     second = route(store, 'sim', plan_fn=no_planner,
                    confirm_fn=lambda plan: pytest.fail('must not run twice'))
-    assert second.kind == 'clarification'
+    assert second.kind == 'duplicate_ignored'
 
 
 def test_cancelling_a_pending_plan_never_calls_confirm_fn(store):
@@ -437,3 +439,79 @@ def test_ambiguous_reply_while_a_plan_is_pending_asks_to_confirm_or_cancel(store
                    confirm_fn=lambda p: pytest.fail('must not execute an ambiguous reply'))
     assert result.kind == 'clarification'
     assert 'sim' in result.message.lower() and 'nao' in result.message.lower()
+
+
+# --- issue #154: duplicate "sim"/"nao" echo after a plan is resolved ----------
+
+def test_duplicate_sim_right_after_confirming_a_plan_does_not_answer_an_unrelated_decision(store):
+    pending(store)  # one unrelated NEEDS_LUCAS decision pending
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+
+    calls = []
+    first = route(store, 'sim', plan_fn=no_planner, confirm_fn=lambda p: (calls.append(p), 'ok')[1])
+    assert first.kind == 'plan_executed'
+    assert len(calls) == 1
+
+    # A second, IDENTICAL "sim" right after must never reach the decision
+    # grammar - confirm_fn must not fire again (nothing left to confirm)
+    # and the unrelated decision must stay untouched.
+    second = route(store, 'sim', plan_fn=no_planner,
+                   confirm_fn=lambda p: pytest.fail('must not re-execute or answer anything else'))
+    assert second.kind == 'duplicate_ignored'
+    assert store.get_pending_decisions()[0]['correlation_id'] == 'decision-1'
+
+
+def test_duplicate_nao_right_after_cancelling_a_plan_does_not_reject_an_unrelated_decision(store):
+    pending(store)
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+    route(store, 'nao', plan_fn=no_planner)
+
+    second = route(store, 'nao', plan_fn=no_planner)
+    assert second.kind == 'duplicate_ignored'
+    assert store.get_pending_decisions()[0]['correlation_id'] == 'decision-1'
+
+
+def test_a_different_reply_after_confirming_a_plan_still_answers_a_pending_decision(store):
+    # Only an IDENTICAL echo is suppressed - a genuinely different reply
+    # (here "aprovo", which the plan grammar never uses) must still reach
+    # the decision it was actually meant for.
+    task, ref = pending(store)
+    plan_task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(plan_task))
+    route(store, 'sim', plan_fn=no_planner, confirm_fn=lambda p: 'ok')
+
+    result = route(store, 'aprovo', plan_fn=no_planner)
+    assert result.kind != 'duplicate_ignored'
+    assert store.get_pending_decisions() == []
+
+
+def test_sim_reaches_a_pending_decision_normally_once_the_echo_window_has_passed(store):
+    from datetime import datetime, timedelta, timezone
+    import orchestrator.decisions as decisions
+
+    pending(store)
+    task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(task))
+    route(store, 'sim', plan_fn=no_planner, confirm_fn=lambda p: 'ok')
+
+    # Backdate the recorded echo past the window - a LATER, genuinely
+    # separate "sim" must be free to answer the (still) pending decision.
+    stale = datetime.now(timezone.utc) - timedelta(seconds=decisions._PLAN_REPLY_ECHO_WINDOW_SECONDS + 1)
+    decisions._record_plan_reply_echo(store, 'sim', now=stale)
+
+    result = route(store, 'sim', plan_fn=no_planner)
+    assert result.kind != 'duplicate_ignored'
+    assert store.get_pending_decisions() == []
+
+
+def test_explicit_ref_reply_is_never_treated_as_a_duplicate_echo(store):
+    task, ref = pending(store)
+    plan_task = Task(title='Fazer X', objective='x', project_id='hub', state=TaskState.PLANNED)
+    route(store, 'Objetivo: fazer X', plan_fn=_fake_planner(plan_task))
+    route(store, 'sim', plan_fn=no_planner, confirm_fn=lambda p: 'ok')
+
+    result = route(store, f'REF: {ref} sim')
+    assert result.kind != 'duplicate_ignored'
+    assert store.get_pending_decisions() == []
