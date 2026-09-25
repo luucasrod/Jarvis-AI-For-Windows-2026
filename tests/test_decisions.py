@@ -48,7 +48,10 @@ def test_format_decision_message_falls_back_to_objective_without_context():
     assert "CONTEXTO:\nobj generico" in message
 
 
-def test_create_pending_decision_persists_even_without_telegram_credentials(tmp_path):
+def test_create_pending_decision_persists_even_without_telegram_credentials(tmp_path, monkeypatch):
+    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CONTROL_CHAT_ID", "TELEGRAM_REPORT_CHAT_ID"):
+        monkeypatch.delenv(key, raising=False)
+
     store = Store(tmp_path / "state.db")
     task = Task(title="X", objective="obj", project_id="cashy")
 

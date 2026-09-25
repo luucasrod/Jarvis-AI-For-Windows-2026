@@ -7,31 +7,44 @@ import pytest
 import orchestrator.config as config_module
 
 
+_CONFIG_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CONTROL_CHAT_ID",
+    "TELEGRAM_REPORT_CHAT_ID",
+    "PAPERCLIP_BASE_URL",
+    "ORCHESTRATOR_TIMEZONE",
+    "CYCLE_START_TIME",
+    "CUTOFF_TIME",
+    "REPORT_TIME",
+    "RATE_LIMIT_BACKOFF_MINUTES",
+    "IDLE_CHECK_MINUTES",
+    "SECONDBRAIN_INDEX_PATH",
+    "RETRY_INTERVAL_SECONDS",
+    "PAPERCLIP_TIMEOUT_SECONDS",
+    "GITHUB_TIMEOUT_SECONDS",
+    "GITHUB_MAX_BACKOFF_SECONDS",
+    "PAPERCLIP_MAX_BACKOFF_SECONDS",
+    "TELEGRAM_SEND_TIMEOUT_SECONDS",
+    "TELEGRAM_POLL_TIMEOUT_SECONDS",
+    "HEARTBEAT_MAX_AGE_SECONDS",
+    "TELEGRAM_HEALTH_MAX_AGE_SECONDS",
+    "GROQ_API_KEY",
+    "GROQ_TRANSCRIBE_MODEL",
+    "PAPERCLIP_SYNC_INTERVAL_SECONDS",
+)
+
+
 def _reload_with_clean_env(monkeypatch, **env_overrides):
-    for key in (
-        "TELEGRAM_BOT_TOKEN",
-        "TELEGRAM_CONTROL_CHAT_ID",
-        "TELEGRAM_REPORT_CHAT_ID",
-        "PAPERCLIP_BASE_URL",
-        "ORCHESTRATOR_TIMEZONE",
-        "CYCLE_START_TIME",
-        "CUTOFF_TIME",
-        "REPORT_TIME",
-        "RATE_LIMIT_BACKOFF_MINUTES",
-        "SECONDBRAIN_INDEX_PATH",
-        "RETRY_INTERVAL_SECONDS",
-        "PAPERCLIP_TIMEOUT_SECONDS",
-        "GITHUB_TIMEOUT_SECONDS",
-        "GITHUB_MAX_BACKOFF_SECONDS",
-        "PAPERCLIP_MAX_BACKOFF_SECONDS",
-        "TELEGRAM_SEND_TIMEOUT_SECONDS",
-        "TELEGRAM_POLL_TIMEOUT_SECONDS",
-        "HEARTBEAT_MAX_AGE_SECONDS",
-        "TELEGRAM_HEALTH_MAX_AGE_SECONDS",
-        "GROQ_API_KEY",
-        "GROQ_TRANSCRIBE_MODEL",
-        "PAPERCLIP_SYNC_INTERVAL_SECONDS",
-    ):
+    real_env_file = config_module._REPO_ROOT / ".env"
+    original_is_file = config_module.Path.is_file
+
+    def is_file_without_real_dotenv(path):
+        if path == real_env_file:
+            return False
+        return original_is_file(path)
+
+    monkeypatch.setattr(config_module.Path, "is_file", is_file_without_real_dotenv)
+    for key in _CONFIG_ENV_VARS:
         monkeypatch.delenv(key, raising=False)
     for key, value in env_overrides.items():
         monkeypatch.setenv(key, value)
