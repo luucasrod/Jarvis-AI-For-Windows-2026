@@ -1,15 +1,16 @@
 # Contexto local do Jarvis
 
-Referencia da issue #43: `integration/orchestration`, commit `e23a74e`, em
-2026-09-13. Confirme codigo e GitHub antes de assumir que esta fotografia
+Referencia da issue #161: `integration/orchestration`, commit `866c582`, em
+2026-09-17. Confirme codigo e GitHub antes de assumir que esta fotografia
 descreve uma entrega posterior.
 
 ## Estado da integracao
 
 `main.py` executa a voz no Windows. O pacote `orchestrator/` fornece planejamento,
-persistencia, integracoes e politicas testadas separadamente. Nesta referencia,
-`main.py` nao importa o pacote e nao existe `orchestrator/orchestrator.py` no
-checkpoint. Iniciar o Jarvis pelos atalhos nao inicia um ciclo diario completo.
+persistencia, integracoes, politicas, ciclo diario, relatorio, fachada de voz e
+runtime Telegram testados separadamente. Nesta referencia, `main.py` importa
+somente `orchestrator.voice_facade` como ponto de contato com o pacote. Iniciar o
+Jarvis pelos atalhos nao inicia o runtime Telegram nem um ciclo diario continuo.
 
 O [WORK_PROTOCOL](WORK_PROTOCOL.md) define revisao cruzada e integracao.
 `integration/wave-0` esta congelada; `integration/orchestration` e o checkpoint
@@ -18,12 +19,12 @@ aberto e intocado. Merge em integracao nao equivale a review PASS.
 
 | Area | Estado nesta referencia |
 | --- | --- |
-| Ciclo diario #30 | PR #130 aberto; review #131 solicita correcoes de admissao, projetos, dispatch, atribuicao e janela do relatorio. Nao integrado. |
-| Ponte de voz #11/#35 | Conexao do pacote ao monolito e respostas reais da fachada pendentes. |
-| Relatorio #32 | Transporte e evento de horario existem; formatacao e consumo automatico pendentes. |
-| Deploy #38 | Descoberta, smoke e criacao automatica de bug pendentes. |
-| Idempotencia #41 | PR #132 integrado; review #133 encontrou duplicacao Telegram em crash, timeout e concorrencia. |
-| Configuracao/E2E #44-#46 | Auditoria final e validacoes completas/controladas/reais pendentes. |
+| Ciclo diario #30 | PR #130 integrado apos correcoes da review #131. `run_daily_cycle`, `run_cutoff` e `run_report` existem em `orchestrator/orchestrator.py`; despacho real para GitHub/Paperclip e atribuicao verificada dependem do chamador/runtime e configuracao. |
+| Ponte de voz #11/#35 | #11 e #35 integradas. `main.py` roteia intents de orquestracao para `voice_facade`, que responde com dados reais de Store, historico, ProjectResolver e Paperclip; pausa/retomada real ainda nao existe. |
+| Relatorio #32 | Integrado. `reporting.process_report_tick` formata, pagina e entrega relatorio no canal Telegram de report, com cursor duravel; entregas incertas exigem reconciliacao manual. |
+| Deploy #38 | Integrado. `deploy_watch.py` descobre estrategia do indice, roda smoke proporcional e cria/reusa episodio BUG_FOUND/NEEDS_LUCAS sem acionar deploy. |
+| Idempotencia #41 | PR #132 e correcoes posteriores integradas. O gap da entrega Telegram de decisoes da review #133 foi fechado com registro duravel/migracao; fluxos com resultado remoto incerto ainda documentam limites proprios. |
+| Configuracao/E2E #44-#46 | #44 integrado: timeouts/backoffs e chaves Groq/Telegram/Paperclip centralizados em `orchestrator/config.py` e `.env.example`. Validacoes controladas/reais finais de #45/#46 permanecem pendentes. |
 
 Consulte as [issues do projeto](https://github.com/luucasrod/Jarvis-AI-For-Windows-2026/issues)
 para mudancas posteriores. A tabela nao e atualizada automaticamente pelo runtime.
@@ -63,22 +64,29 @@ Os caminhos desta tabela sao relativos a `orchestrator/`.
 | `agent_policy.py` | Classifica tarefa, preferencia/fallback/revisor e hotspots SOLO. Preferencia nao e ID Paperclip. |
 | `task_queue.py` | Calcula elegibilidade por dependencias DONE e materializa plano em Issues ou fila local declarada. |
 | `scheduler.py` | Admite tarefas e registra ciclo/cutoff/relatorio com horario e guards persistidos. Nao inicia thread. |
+| `orchestrator.py` | Compoe ciclo diario, cutoff e coleta bruta de relatorio; materializa tarefas, despacha para Paperclip/GitHub e confirma atribuicao quando chamado. |
 | `agent_availability.py` | Persiste cooldown e redireciona FLEX READY quando existe alternativa permitida; preserva trabalho em andamento. |
 | `review_pipeline.py` | Exige revisor distinto, registra resultado/escalacao. O consumidor precisa aplicar recommended_state. |
 | `merge_policy.py` | Exige review do mesmo head/repo/PR/tarefa, checks, base e estado; merge condicionado ao head, com reconciliacao atomica de evento/audit. |
 | `github_client.py` | CLI gh, criacao idempotente, fila persistente, reconciliacao e rate limit. |
 | `paperclip_ops.py` | Criacao/status pela API existente e PaperclipSession com backoff/deteccao de restart. |
+| `paperclip_sync.py` | Sincroniza conclusoes reais do Paperclip e destrava dependentes quando o runtime chama o tick. |
 | `telegram_bot.py` | Canais separados, filtro de updates de controle e evidencia de entrega quando recebe Store. |
 | `decisions.py` | REF/pergunta, persistencia de decisoes, parsing de controle e prioridade. |
+| `reporting.py` | Consome REPORT_TIME_REACHED, formata/pagina relatorio diario e confirma cursor atomico apos entrega. |
+| `deploy_watch.py` | Descobre estrategia de deploy, faz smoke check proporcional e registra episodios de falha/bug sem disparar deploy. |
+| `voice_facade.py` | Ponte unica do monolito de voz para dados reais da orquestracao; nao inventa controle ainda inexistente. |
+| `runtime.py` | Loop Telegram persistente: poll de controle, confirmacao de planos, relatorio diario e sync Paperclip; nao e iniciado pelos atalhos do monolito. |
 | `history.py` | Resumo de eventos desde um instante; nao envia relatorio. |
 | `healthcheck.py` | Evidencia de saude e diagnostico de ociosidade; nao inicia recuperacao automatica. |
 | `models.py`, `persistence.py`, `events.py`, `audit.py` | Modelos, SQLite, eventos e auditoria com redacao de segredos em extras. |
 
 O fluxo a compor e: resolver projeto -> planejar -> persistir/admitir ->
 selecionar elegiveis -> materializar -> atribuir agente remoto -> observar
-execucao -> revisao cruzada -> merge -> historico/relatorio. Importar os modulos
-nao executa essa cadeia. Criacao Paperclip nao comprova atribuicao ou progresso:
-o consumidor precisa identificar o agente concreto e observar o estado remoto.
+execucao -> revisao cruzada -> merge -> historico/relatorio. `run_daily_cycle`
+implementa a parte admissao/materializacao/despacho para um projeto quando e
+chamado; importar os modulos nao executa essa cadeia. Criacao Paperclip so conta
+como progresso de despacho quando a atribuicao ao agente concreto e confirmada.
 
 `materialize_plan` respeita a fonte de tarefas do projeto. A fila local precisa
 resolver dentro da raiz canonica e usa marcador por correlation_id. Dependencias
@@ -109,9 +117,11 @@ usam a conexao recebida, sem rede ou commits internos.
 GitHub reconcilia criacao incerta por marcador; Paperclip usa chave de operacao
 e resultado duravel. Nao apague claims/banco para forcar retry. Merge confirma
 estado remoto depois da CLI e registra conclusao atomicamente; atualizar Task
-continua responsabilidade do consumidor. Telegram tem lacuna conhecida na
-#133: chave posterior ao envio nao protege crash antes do commit, timeout de
-resposta ou concorrencia. Nao ha garantia de ausencia de duplicatas nesse envio.
+continua responsabilidade do consumidor. Decisoes Telegram usam entrega duravel
+para evitar reenvio de confirmacoes ja registradas, inclusive migracao legado
+da #41. Relatorio diario reserva paginas antes do POST e marca resultado
+`uncertain` quando nao pode provar a entrega; reconciliacao manual continua
+necessaria nesses casos.
 
 ## Horarios e interacao
 
@@ -119,13 +129,17 @@ Defaults: Europe/Lisbon, inicio 08:00, cutoff 14:00, relatorio 17:00. Janela de
 admissao: inicio inclusivo/cutoff exclusivo. Cutoff nao interrompe IN_PROGRESS;
 tarefas novas fora da janela vao para NEXT_CYCLE. Guards por data protegem
 efeitos locais apos restart, DST e recuo do relogio. REPORT_TIME_REACHED nao
-significa mensagem enviada. Veja [SCHEDULER.md](SCHEDULER.md).
+significa mensagem enviada; `process_report_tick` precisa consumir o evento e
+confirmar a entrega. Veja [SCHEDULER.md](SCHEDULER.md) e
+[DAILY_REPORT.md](DAILY_REPORT.md).
 
-Telegram separa TELEGRAM_CONTROL_CHAT_ID de TELEGRAM_REPORT_CHAT_ID. Poll e uma
-chamada, nao loop persistente; o runtime precisa preservar cursor e rotear
-somente texto autorizado. [CONTROL_MESSAGES.md](CONTROL_MESSAGES.md) descreve
-objetivos, prioridade e respostas por REF. A ultima decisao respondida pode
-devolver NEEDS_LUCAS a PLANNED para readmissao, sem retomar agente automaticamente.
+Telegram separa TELEGRAM_CONTROL_CHAT_ID de TELEGRAM_REPORT_CHAT_ID. O bot ainda
+oferece primitivas de poll/envio separadas, e `runtime.run_forever` fornece o
+loop persistente que preserva cursor, rotea mensagens autorizadas, chama o tick
+do relatorio e sincroniza conclusoes do Paperclip. [CONTROL_MESSAGES.md](CONTROL_MESSAGES.md)
+descreve objetivos, prioridade e respostas por REF. A ultima decisao respondida
+pode devolver NEEDS_LUCAS a PLANNED para readmissao, sem retomar agente
+automaticamente.
 
 `check_idle` considera READY elegiveis, atividade, cooldown e pausas explicadas.
 Emite DECISION_REQUIRED uma vez por episodio inexplicado; nao remove pausas
@@ -147,11 +161,13 @@ lista configuracao. Nao sobrescreva arquivos locais existentes. O cliente le
 PAPERCLIP_API_TOKEN quando necessario; local_trusted em loopback nao garante
 acesso sem autenticacao a qualquer URL remota.
 
-`validate_config` avisa sobre Telegram ausente e retry/timeout invalidos;
-nao valida credenciais nem cobre toda configuracao final. Scheduler valida
-fuso/horarios; auditoria completa e #44. SECONDBRAIN_INDEX_PATH aponta por
-default para `A:\SecondBrain\project_context_index.json`; configure o caminho
-real da maquina. A nota local de infraestrutura continua em
+`validate_config` avisa sobre Telegram ausente e segundos invalidos para retry,
+GitHub, Paperclip, Telegram, healthcheck e sync. Nao valida credenciais.
+Scheduler valida fuso/horarios. A auditoria de #44 foi integrada; validacoes
+controladas/reais de #45/#46 ainda nao substituem testes com mocks.
+SECONDBRAIN_INDEX_PATH aponta por default para
+`A:\SecondBrain\project_context_index.json`; configure o caminho real da
+maquina. A nota local de infraestrutura continua em
 `A:\SecondBrain\01-Projects\Casa-Inteligente\Contexto.md`, sem copiar seu conteudo
 para este repo. Nao versione tokens, memoria, bancos ou logs.
 
