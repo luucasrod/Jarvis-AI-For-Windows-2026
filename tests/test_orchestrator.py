@@ -289,6 +289,66 @@ def test_daily_cycle_never_dispatches_another_projects_task(store):
     assert [entry[1] for entry in paperclip.created] == ["Belongs here"]
 
 
+def test_daily_cycle_holds_solo_task_when_same_project_solo_is_active(store):
+    active = _task(
+        title="Active SOLO work", state=TaskState.IN_PROGRESS,
+        execution_mode=ExecutionMode.SOLO, preferred_agent=AgentName.CLAUDE,
+    )
+    store.save_task(active)
+    waiting = _task(
+        title="Waiting SOLO work", state=TaskState.READY,
+        execution_mode=ExecutionMode.SOLO, preferred_agent=AgentName.CODEX,
+    )
+    store.save_task(waiting)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    result = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert waiting.id in result.ready_task_ids
+    assert paperclip.created == []
+    assert waiting.id not in result.assigned_task_ids
+    assert waiting.id not in result.dispatch_incomplete_task_ids
+    assert store.get_task(waiting.id).state == TaskState.READY
+
+
+def test_daily_cycle_allows_solo_tasks_from_different_projects(store):
+    other_project = ProjectContext(
+        canonical_id="other", root="/other", repository="owner/other",
+        task_source="GitHub Issues (`gh issue list` in this repo) - the real work queue",
+    )
+    hub_task = _task(
+        title="Hub SOLO work", state=TaskState.READY,
+        execution_mode=ExecutionMode.SOLO, preferred_agent=AgentName.CLAUDE,
+    )
+    other_task = _task(
+        title="Other SOLO work", state=TaskState.READY, project_id="other",
+        execution_mode=ExecutionMode.SOLO, preferred_agent=AgentName.CODEX,
+    )
+    store.save_task(hub_task)
+    store.save_task(other_task)
+
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(store, github)
+    paperclip = FakePaperclipSession()
+
+    first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                            company_id="acme", clock=clock)
+    second = run_daily_cycle(store, other_project, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert hub_task.id in first.assigned_task_ids
+    assert other_task.id in second.assigned_task_ids
+    assert store.get_task(hub_task.id).state == TaskState.IN_PROGRESS
+    assert store.get_task(other_task.id).state == TaskState.IN_PROGRESS
+    assert [entry[1] for entry in paperclip.created] == ["Hub SOLO work", "Other SOLO work"]
+
+
 def test_daily_cycle_skips_paperclip_dispatch_when_all_concrete_agents_are_in_cooldown(store):
     # Review Task #131 finding #3/#4: never create executable work with
     # no free concrete agent - both configured candidates are limited.
