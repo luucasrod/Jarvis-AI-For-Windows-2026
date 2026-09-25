@@ -129,6 +129,77 @@ def _github_client(store, github):
     return GitHubClient(store, run_fn=github.run, timeout_seconds=5)
 
 
+def test_github_retry_on_429_then_success(store):
+    calls = []
+    sleeps = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            body = (
+                'HTTP/2.0 429 Response\r\n'
+                'Retry-After: 1\r\n'
+                'Content-Type: application/json\r\n\r\n'
+                '{"message":"rate limited"}'
+            )
+            return subprocess.CompletedProcess(args, 1, body, "HTTP 429")
+        return subprocess.CompletedProcess(args, 0, json.dumps([[{"number": 3, "title": "Cached"}]]), "")
+
+    client = GitHubClient(
+        store, run_fn=run, timeout_seconds=5, sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+
+    result = client.list_issues("owner/repo")
+
+    assert result["available"] is True
+    assert [issue["number"] for issue in result["issues"]] == [3]
+    assert sleeps == [1.0]
+    assert len(calls) == 2
+    assert store.get_sync_value("github:github.com:retry_not_before") is None
+
+
+def test_github_fallback_to_cache_when_offline(store):
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    github.issues = [{"number": 7, "title": "Cached dispatch", "body": "old body"}]
+    client = GitHubClient(
+        store, run_fn=github.run, clock=clock, timeout_seconds=5, sleep_fn=lambda seconds: None,
+    )
+    assert client.list_issues("owner/repo", state="all")["available"]
+    clock.advance(minutes=6)
+
+    def offline(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, "", "network is unreachable")
+
+    client.run = offline
+    task = _task(title="Cached dispatch", state=TaskState.READY)
+    store.save_task(task)
+
+    result = run_daily_cycle(store, PROJECT, client=client, clock=clock)
+
+    assert result.created_issue_numbers == [7]
+    assert github.posts == []
+
+
+def test_github_fail_fast_on_401(store):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        body = 'HTTP/2.0 401 Response\r\nContent-Type: application/json\r\n\r\n{"message":"bad credentials"}'
+        return subprocess.CompletedProcess(args, 1, body, "HTTP 401")
+
+    client = GitHubClient(
+        store, run_fn=run, timeout_seconds=5, sleep_fn=lambda seconds: pytest.fail("401 must not back off"),
+    )
+
+    result = client.create_issue("owner/repo", "Blocked", "Body", [], "corr-401")
+
+    assert result["reason"] == "github_http_401"
+    assert result["pending"] is False
+    assert len(calls) == 1
+
+
 def test_daily_cycle_promotes_ready_dependent_and_leaves_blocked(store):
     # 3 tasks (test plan): one already free, one dependent on it, one
     # explicitly BLOCKED - only the first two are ever eligible.

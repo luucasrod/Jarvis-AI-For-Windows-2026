@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from urllib.parse import urlencode
 
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.events import EventType, emit_in_transaction
+from orchestrator.github_cache import GitHubCache
 from orchestrator.persistence import Store
 
 _SCHEMA = """
@@ -112,7 +114,8 @@ def _valid_issue(item) -> bool:
 class GitHubClient:
     def __init__(self, store: Store, *, config: OrchestratorConfig | None = None,
                  run_fn: Callable | None = None, clock: Callable[[], datetime] | None = None,
-                 timeout_seconds: float | None = None, max_backoff_seconds: float | None = None):
+                 timeout_seconds: float | None = None, max_backoff_seconds: float | None = None,
+                 sleep_fn: Callable[[float], None] | None = None):
         self.store = store
         cfg = config or load_config()
         # #44: defaults come from config (GITHUB_TIMEOUT_SECONDS/
@@ -128,7 +131,9 @@ class GitHubClient:
         self.timeout = timeout_seconds
         self.lease = 2 * timeout_seconds + 30
         self.run = run_fn or subprocess.run
+        self.sleep = sleep_fn if sleep_fn is not None else (lambda seconds: None if run_fn is not None else time.sleep(seconds))
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.cache = GitHubCache(store)
         store.ensure_schema(_SCHEMA)
 
     def _now(self) -> datetime:
@@ -138,6 +143,35 @@ class GitHubClient:
         return now.astimezone(timezone.utc)
 
     def _api(self, method: str, endpoint: str, payload: dict | None = None, *, paginate=False):
+        if method != 'GET':
+            return self._api_once(method, endpoint, payload, paginate=paginate)
+        last_error = None
+        for attempt in range(4):
+            try:
+                return self._api_once(
+                    method, endpoint, payload, paginate=paginate, record_rate_limit=attempt == 3,
+                )
+            except _Failure as error:
+                last_error = error
+                if attempt == 3 or not self._retry_api_failure(error):
+                    raise
+                self.sleep(float(2 ** attempt))
+        raise last_error
+
+    @staticmethod
+    def _retry_api_failure(error: _Failure) -> bool:
+        if not error.retryable or error.reason == 'github_rate_limited':
+            return False
+        match = re.fullmatch(r'github_http_(\d{3})', error.reason)
+        if match:
+            status = int(match.group(1))
+            return status == 429 or status == 408 or status >= 500
+        return error.reason in {
+            'timeout', 'process_unavailable', 'github_unavailable', 'invalid_github_response',
+        }
+
+    def _api_once(self, method: str, endpoint: str, payload: dict | None = None, *, paginate=False,
+                  record_rate_limit=True):
         now = self._now().timestamp()
         stored_deadline = self.store.get_sync_value(_RATE_KEY)
         try:
@@ -176,22 +210,24 @@ class GitHubClient:
                 retry_at = _server_retry_at(headers, self._now().timestamp())
                 # Shared across operations/client instances using this Store.
                 # A shorter concurrent observation never shortens a cooldown.
-                def record_limit(connection):
-                    row = connection.execute('SELECT value FROM sync_state WHERE key=?', (_RATE_KEY,)).fetchone()
-                    try:
-                        previous = float(row[0]) if row else 0
-                    except (ValueError, TypeError):
-                        previous = 0
-                    value = max(previous, retry_at) if math.isfinite(previous) else retry_at
-                    connection.execute('INSERT INTO sync_state (key,value) VALUES (?,?) '
-                                       'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (_RATE_KEY, str(value)))
-                self.store.run_in_transaction(record_limit)
+                if record_rate_limit:
+                    def record_limit(connection):
+                        row = connection.execute('SELECT value FROM sync_state WHERE key=?', (_RATE_KEY,)).fetchone()
+                        try:
+                            previous = float(row[0]) if row else 0
+                        except (ValueError, TypeError):
+                            previous = 0
+                        value = max(previous, retry_at) if math.isfinite(previous) else retry_at
+                        connection.execute('INSERT INTO sync_state (key,value) VALUES (?,?) '
+                                           'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (_RATE_KEY, str(value)))
+                    self.store.run_in_transaction(record_limit)
             not_sent = any(text in stderr.lower() for text in ('no such host', 'connection refused', 'network is unreachable'))
             rejected = status is not None and 400 <= status < 500 and status != 408
             raise _Failure(
                 f'github_http_{status}' if status else 'github_unavailable',
                 uncertain=method == 'POST' and not (not_sent or rejected),
-                retryable=status not in (400, 404, 422),
+                retryable=status is None or status == 408 or status == 429 or status >= 500
+                or (status == 403 and retry_at is not None),
                 retry_at=retry_at,
             )
         try:
@@ -209,6 +245,11 @@ class GitHubClient:
             params = {'state': state, 'per_page': 100}
             if labels:
                 params['labels'] = ','.join(labels)
+            now = self._now().timestamp()
+            cache_key = GitHubCache.issue_list_key(repo, state, labels)
+            cached = self.cache.get(cache_key, now)
+            if cached is not None and cached.fresh:
+                return {'available': True, 'issues': cached.payload, 'cached': True, 'stale': False}
             pages = self._api('GET', f'repos/{repo}/issues?{urlencode(params)}', paginate=True)
             if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
                 raise _Failure('invalid_issue_list')
@@ -220,10 +261,17 @@ class GitHubClient:
                     if not _valid_issue(item):
                         raise _Failure('invalid_issue_list')
                     issues.append(item)
+            self.cache.put(cache_key, issues, now)
             return {'available': True, 'issues': issues}
         except ValueError:
             return {'available': False, 'reason': 'invalid_list_input'}
         except _Failure as error:
+            cached = self.cache.get(cache_key, self._now().timestamp()) if 'cache_key' in locals() else None
+            if cached is not None and error.retryable:
+                return {
+                    'available': True, 'issues': cached.payload, 'cached': True, 'stale': True,
+                    'fallback_reason': error.reason,
+                }
             return {'available': False, 'reason': error.reason, 'retryable': error.retryable,
                     'retry_at': error.retry_at}
         except sqlite3.Error:
@@ -287,6 +335,7 @@ class GitHubClient:
             issue = self._api('PATCH', f'repos/{repo}/issues/{issue_number}', {'body': body})
             if not _valid_issue(issue):
                 raise _Failure('invalid_updated_issue')
+            self.cache.invalidate_issue_lists(repo)
             return {'available': True, 'number': issue['number']}
         except ValueError:
             return {'available': False, 'reason': 'invalid_update_input'}
@@ -329,6 +378,8 @@ class GitHubClient:
                     correlation_id=payload['correlation_id'], created_at=now,
                 )
         self.store.run_in_transaction(complete)
+        payload = json.loads(self._row(key)['payload'])
+        self.cache.invalidate_issue_lists(payload['repo'])
         return self._result(key)
 
     def _process(self, key: str) -> dict:
@@ -378,6 +429,7 @@ class GitHubClient:
             row = self._row(key)
             if row['owner'] != owner or row['status'] != 'posting':
                 return self._result(key)
+            self.cache.invalidate_issue_lists(payload['repo'])
             issue = self._api('POST', f"repos/{payload['repo']}/issues", {
                 'title': payload['title'], 'body': f"{payload['body']}\n\n{marker}", 'labels': payload['labels'],
             })
