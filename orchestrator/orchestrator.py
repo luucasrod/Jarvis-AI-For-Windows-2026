@@ -271,6 +271,28 @@ def _reserve_dispatch_intent(
     return store.run_in_transaction(apply)
 
 
+def _mark_dispatched_in_progress(
+    store: Store, task_id: str, project_id: str, now: datetime,
+) -> bool:
+    """Persist READY -> IN_PROGRESS after Paperclip confirms assignment."""
+    def apply(connection):
+        row = connection.execute("SELECT data FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        current = Task.from_dict(json.loads(row[0]))
+        if current.state != TaskState.READY or current.project_id != project_id:
+            return False
+        current.state = TaskState.IN_PROGRESS
+        current.updated_at = now
+        connection.execute(
+            "UPDATE tasks SET state = ?, data = ? WHERE id = ?",
+            (TaskState.IN_PROGRESS.value, json.dumps(current.to_dict()), task_id),
+        )
+        return True
+
+    return store.run_in_transaction(apply)
+
+
 def run_daily_cycle(
     store: Store,
     project_context,
@@ -473,7 +495,10 @@ def run_daily_cycle(
                 and status["task"].get("assigneeAgentId") == agent_id
             )
             if confirmed_assignee:
-                assigned.append(task.id)
+                if _mark_dispatched_in_progress(store, task.id, project_context.canonical_id, now):
+                    assigned.append(task.id)
+                else:
+                    dispatch_incomplete.append(task.id)
             else:
                 dispatch_incomplete.append(task.id)
 

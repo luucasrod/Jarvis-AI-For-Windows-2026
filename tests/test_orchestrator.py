@@ -417,10 +417,11 @@ def test_daily_cycle_reuses_existing_assignment_instead_of_conflicting_on_retry(
     second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
                              company_id="acme", clock=clock)
 
-    assert task.id in second.assigned_task_ids
+    assert task.id not in second.assigned_task_ids
     assert task.id not in second.dispatch_incomplete_task_ids
-    assert len(transport.tasks) == 1  # no second POST at all - existing assignment reused
+    assert len(transport.tasks) == 1  # no second POST at all - local IN_PROGRESS is durable
     assert transport.tasks[-1]["assigneeAgentId"] == "agent-claude"  # SAME id, never agent-codex
+    assert store.get_task(task.id).state == TaskState.IN_PROGRESS
 
 
 def test_daily_cycle_reassigns_reviewer_when_it_collides_with_the_resolved_implementer(store):
@@ -575,6 +576,9 @@ def test_daily_cycle_never_reuses_dispatch_intent_across_a_different_paperclip_s
     run_daily_cycle(store, PROJECT, client=client, paperclip_session=session_a,
                     company_id="acme", clock=clock)
     assert session_a.created[-1][3] == "agent-claude-http://server-a"
+    current = store.get_task(task.id)
+    current.state = TaskState.READY  # simulate crash before #169's local state transition
+    store.save_task(current)
 
     session_b = FakePaperclipSession(config=OrchestratorConfig(paperclip_base_url="http://server-b"))
     run_daily_cycle(store, PROJECT, client=client, paperclip_session=session_b,
@@ -633,14 +637,15 @@ def test_daily_cycle_revalidates_reviewer_on_a_replay_that_reused_an_existing_in
     clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
     github = FakeGitHub()
     client = _github_client(store, github)
-    paperclip = FakePaperclipSession()
+    paperclip = FakePaperclipSession(available=False)
 
     first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
                             company_id="acme", clock=clock)
-    assert task.id in first.assigned_task_ids
+    assert task.id in first.dispatch_incomplete_task_ids
     assert paperclip.created[-1][3] == "agent-claude"
 
     mark_rate_limited(store, AgentName.CLAUDE, "quota")  # redirects preference to Codex
+    paperclip.available = True
 
     second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
                              company_id="acme", clock=clock)
@@ -798,7 +803,45 @@ def test_daily_cycle_is_idempotent_on_rerun(store):
     # already materialized - no duplicate Issue or Paperclip task.
     assert second.cycle_fired is False
     assert len(github.posts) == 1
-    assert len(paperclip.created) == 2  # called again, but idempotent server-side per its own contract
+    assert len(paperclip.created) == 1  # local IN_PROGRESS prevents a duplicate dispatch call
+
+
+def test_paperclip_assignment_persists_in_progress_across_restart_without_duplicate_dispatch(tmp_path):
+    db_path = tmp_path / "state.db"
+    first_store = Store(db_path)
+    task = _task(title="Durable dispatch", state=TaskState.READY, preferred_agent=AgentName.CLAUDE)
+    first_store.save_task(task)
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    github = FakeGitHub()
+    client = _github_client(first_store, github)
+    paperclip = FakePaperclipSession()
+
+    first = run_daily_cycle(
+        first_store, PROJECT, client=client, paperclip_session=paperclip,
+        company_id="acme", clock=clock,
+    )
+
+    assert task.id in first.assigned_task_ids
+    assert first_store.get_task(task.id).state == TaskState.IN_PROGRESS
+    assert run_report(first_store, since=clock.now - timedelta(hours=1), clock=clock)["tasks_in_progress"] == [task.id]
+    assert len(paperclip.created) == 1
+    first_store.close()
+
+    reopened = Store(db_path)
+    try:
+        retry_paperclip = FakePaperclipSession()
+        retry = run_daily_cycle(
+            reopened, PROJECT, client=_github_client(reopened, github), paperclip_session=retry_paperclip,
+            company_id="acme", clock=clock,
+        )
+
+        assert reopened.get_task(task.id).state == TaskState.IN_PROGRESS
+        assert retry.assigned_task_ids == []
+        assert retry.dispatch_incomplete_task_ids == []
+        assert retry_paperclip.created == []
+        assert run_report(reopened, since=clock.now - timedelta(hours=1), clock=clock)["tasks_in_progress"] == [task.id]
+    finally:
+        reopened.close()
 
 
 def test_run_cutoff_does_not_touch_in_progress_tasks(store):
