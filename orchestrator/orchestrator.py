@@ -31,7 +31,7 @@ from orchestrator.decisions import get_priority_queue, load_pending_plan
 from orchestrator.github_client import GitHubClient
 from orchestrator.healthcheck import IdleDiagnosis, check_idle
 from orchestrator.history import diff_since
-from orchestrator.models import AgentName, Task, TaskState
+from orchestrator.models import AgentName, ExecutionMode, Task, TaskState
 from orchestrator.paperclip_ops import PaperclipSession
 from orchestrator.persistence import Store
 from orchestrator.planner import PlanResult
@@ -226,6 +226,8 @@ def _reserve_dispatch_intent(
             dep_row = connection.execute("SELECT state FROM tasks WHERE id = ?", (dep_id,)).fetchone()
             if dep_row is None or dep_row[0] != TaskState.DONE.value:
                 return None
+        if _has_active_solo_conflict(connection, current):
+            return None
 
         existing = connection.execute(
             "SELECT agent_id, title, description, implementer FROM orchestrator_dispatch_intent "
@@ -268,6 +270,35 @@ def _reserve_dispatch_intent(
         ).fetchone()
 
     store.ensure_schema(_DISPATCH_INTENT_SCHEMA)
+    return store.run_in_transaction(apply)
+
+
+def _has_active_solo_conflict(connection, current: Task) -> bool:
+    if current.execution_mode != ExecutionMode.SOLO or current.project_id is None:
+        return False
+    rows = connection.execute(
+        "SELECT id, data FROM tasks WHERE state IN (?, ?)",
+        (TaskState.IN_PROGRESS.value, TaskState.IN_REVIEW.value),
+    ).fetchall()
+    for other_id, data in rows:
+        if other_id == current.id:
+            continue
+        other = Task.from_dict(json.loads(data))
+        if other.project_id == current.project_id and other.execution_mode == ExecutionMode.SOLO:
+            return True
+    return False
+
+
+def _solo_conflict_blocks_dispatch(store: Store, task_id: str, project_id: str) -> bool:
+    def apply(connection):
+        row = connection.execute("SELECT data FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        current = Task.from_dict(json.loads(row[0]))
+        if current.state != TaskState.READY or current.project_id != project_id:
+            return False
+        return _has_active_solo_conflict(connection, current)
+
     return store.run_in_transaction(apply)
 
 
@@ -451,6 +482,8 @@ def run_daily_cycle(
     if paperclip_session is not None and company_id is not None:
         server = _dispatch_server(paperclip_session)
         for task in dispatchable:
+            if _solo_conflict_blocks_dispatch(store, task.id, project_context.canonical_id):
+                continue
             # A cheap outside peek decides whether a NEW agent needs
             # resolving at all - an EXISTING intent needs no renewed
             # availability requirement, the decision was already made once
