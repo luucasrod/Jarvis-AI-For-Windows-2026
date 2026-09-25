@@ -12,6 +12,7 @@ import pytest
 
 import paperclip_client as pc
 from orchestrator.agent_availability import mark_rate_limited
+from orchestrator.audit import query_audit
 from orchestrator.config import OrchestratorConfig
 from orchestrator.events import EventType, emit
 from orchestrator.github_client import GitHubClient
@@ -92,7 +93,7 @@ class FakePaperclipSession:
         self._tasks[task_id] = remote
         return {"available": True, "task_id": task_id, "task": remote}
 
-    def get_task_status(self, company_id, task_id):
+    def get_task_status(self, company_id, task_id, *, store=None):
         task = self._tasks.get(task_id)
         if task is None:
             return {"available": False, "reason": "not_found"}
@@ -198,6 +199,130 @@ def test_github_fail_fast_on_401(store):
     assert result["reason"] == "github_http_401"
     assert result["pending"] is False
     assert len(calls) == 1
+
+
+def test_paperclip_retry_on_timeout_then_success(store, monkeypatch):
+    calls = {"list": 0, "create": 0}
+    sleeps = []
+
+    def flaky_list(company_id, *, query=None, base_url=None, timeout=None):
+        calls["list"] += 1
+        if calls["list"] == 1:
+            return None, "timeout"
+        return [], None
+
+    def create_task(company_id, title, description, assignee_agent_id=None, *, base_url=None, timeout=None):
+        calls["create"] += 1
+        return {
+            "id": "pc-1", "title": title, "description": description,
+            "status": "backlog", "assigneeAgentId": assignee_agent_id,
+        }, None
+
+    monkeypatch.setattr("orchestrator.paperclip_ops.client.list_company_tasks", flaky_list)
+    monkeypatch.setattr("orchestrator.paperclip_ops.client.create_task", create_task)
+
+    session = PaperclipSession(
+        config=OrchestratorConfig(paperclip_base_url="http://paperclip.invalid"),
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+
+    result = session.create_task_idempotent("acme", "Retry me", "Body", "corr-retry", "agent-claude", store=store)
+
+    assert result["available"] is True
+    assert result["task_id"] == "pc-1"
+    assert sleeps == [1.0]
+    assert calls == {"list": 2, "create": 1}
+
+
+def test_paperclip_fallback_to_cache_when_unavailable(store, monkeypatch):
+    class Response:
+        def __init__(self, payload, status=200):
+            self.payload, self.status_code, self.text = payload, status, "response"
+
+        def json(self):
+            return self.payload
+
+    class Transport:
+        def __init__(self):
+            self.tasks = []
+            self.down = False
+
+        def get(self, url, **kwargs):
+            if self.down:
+                raise pc.requests.exceptions.Timeout()
+            return Response(list(self.tasks))
+
+        def post(self, url, **kwargs):
+            created = {"id": "pc-1", "status": "backlog", **kwargs["json"]}
+            self.tasks.append(created)
+            return Response(created, 201)
+
+    class MonotonicClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    transport = Transport()
+    monkeypatch.setattr(pc.requests, "get", transport.get)
+    monkeypatch.setattr(pc.requests, "post", transport.post)
+    monkeypatch.setattr(pc, "_CONFIG_TOKEN", "")
+    monkeypatch.delenv("PAPERCLIP_API_TOKEN", raising=False)
+
+    task = _task(title="Cache-backed dispatch", state=TaskState.READY,
+                 preferred_agent=AgentName.CLAUDE, agent_class=AgentClass.CLAUDE)
+    store.save_task(task)
+    clock = Clock(datetime(2026, 9, 13, 9, 0, tzinfo=timezone.utc))
+    mono = MonotonicClock()
+    paperclip = PaperclipSession(
+        config=OrchestratorConfig(paperclip_base_url="http://paperclip.invalid"),
+        clock=mono,
+    )
+    client = _github_client(store, FakeGitHub())
+
+    first = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                            company_id="acme", clock=clock)
+    assert task.id in first.assigned_task_ids
+
+    current = store.get_task(task.id)
+    current.state = TaskState.READY
+    store.save_task(current)
+    mono.value += 6 * 60
+    clock.advance(minutes=6)
+    transport.down = True
+
+    second = run_daily_cycle(store, PROJECT, client=client, paperclip_session=paperclip,
+                             company_id="acme", clock=clock)
+
+    assert task.id in second.assigned_task_ids
+    assert task.id not in second.dispatch_incomplete_task_ids
+    fallback_entries = [
+        entry for entry in query_audit(store)
+        if entry["action"] == "paperclip_status_fallback"
+    ]
+    assert fallback_entries[-1]["result"] == "stale_cache_used"
+    assert fallback_entries[-1]["extra"]["reason"] == "timeout"
+
+
+def test_paperclip_fail_fast_on_401(store, monkeypatch):
+    calls = []
+
+    def unauthorized(company_id, *, query=None, base_url=None, timeout=None):
+        calls.append(company_id)
+        return None, "autenticação recusada"
+
+    monkeypatch.setattr("orchestrator.paperclip_ops.client.list_company_tasks", unauthorized)
+    session = PaperclipSession(
+        config=OrchestratorConfig(paperclip_base_url="http://paperclip.invalid"),
+        sleep_fn=lambda seconds: pytest.fail("401 must not retry"),
+    )
+
+    result = session.get_task_status("acme", "pc-401", store=store)
+
+    assert result["available"] is False
+    assert result["reason"] == "autenticação recusada"
+    assert calls == ["acme"]
 
 
 def test_daily_cycle_promotes_ready_dependent_and_leaves_blocked(store):
