@@ -13,11 +13,11 @@ Segue `WORK_PROTOCOL.md` já existente: cada item vira Issue no GitHub, branch p
 - [x] Review crítica independente (Codex) — REVIEW.md, 6 correções + 6 gaps novos incorporados
 - [ ] Checkpoint: PR desta branch para `integration/orchestration`
 
-## Fase 1 — Correções de baixo risco, alto valor (paralelizável, sem dependência entre si)
-1. **G2 — Corrigir vazamento de env em teste**: `_reload_with_clean_env` em `test_orchestrator_config.py` deve limpar `os.environ` de fato. Critério de aceite: os 4 testes falhando passam.
-2. **G7 — Limpeza de worktrees órfãos**: script determinístico com dry-run revisado antes de remover (65 atuais já confirmados seguros).
-3. **G11 — Atualizar CONTEXT.md**: refletir HEAD atual (`866c582`).
-4. **Ação humana (NEEDS_HUMAN, fora do harness)**: rotacionar token do bot do Telegram exposto durante a auditoria.
+## Fase 1 — Correções de baixo risco, alto valor (CONCLUÍDA 2026-09-25)
+1. [x] **G2** — Issue #159 → PR #162 (mergeado, `integration/orchestration`). 779 testes passando.
+2. [x] **G7** — Issue #160 → PR #166 (mergeado). Script `orchestrator/tools/cleanup_worktrees.py` com `--dry-run`/`--apply`; dry-run real confirmou 52 worktrees seguros de remover. `--apply` real ainda não executado (próxima ação operacional, fora desta Issue).
+3. [x] **G11** — Issue #161 → PR #164 (mergeado). CONTEXT.md refletindo HEAD `866c582`.
+4. [ ] **Ação humana pendente (NEEDS_HUMAN)**: rotacionar token do bot do Telegram exposto durante a auditoria — nenhum agente pode fazer isso, requer o usuário no painel do BotFather.
 
 ## Fase 2 — Estado de dispatch durável (resolve G12 — pré-requisito de Fase 3)
 1. No ponto em que `create_task_idempotent` confirma aceite pelo Paperclip, persistir `READY -> IN_PROGRESS` via `run_in_transaction`.
