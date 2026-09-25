@@ -17,7 +17,7 @@
 |---|---|---|
 | `scheduler.py` | Madura | `check_and_fire()` chamado externamente (não é loop próprio), dedup por dia via SQLite `run_sync_once`, `reconsider()` reavalia tarefa NEXT_CYCLE se dependência resolve no mesmo dia |
 | `planner.py` | Madura | Pipeline real de 5 estágios: screen NEEDS_LUCAS → resolução de projeto → plano LLM → autocrítica LLM → decomposição JSON. Detecção de ciclo real (Tarjan-like), rodada 2x (pós-decomposição e pós-dedup) |
-| `task_queue.py` | Madura | Elegibilidade computada (não armazenada) via `get_promotable_tasks`; prioridade por rank+created_at; `materialize_plan` cria Issues reais no GitHub com batching topológico |
+| `task_queue.py` | Madura | `get_promotable_tasks` é um filtro puro (não muta estado, não acessa `Store`) que computa elegibilidade por dependência a partir de uma lista snapshot; `materialize_plan` cria Issues reais no GitHub com batching topológico. **Correção**: prioridade por rank+created_at é responsabilidade de `decisions.get_priority_queue()`, não deste módulo |
 | `merge_policy.py` | Madura, mas **sem fila real** | Verifica review PASS (task/repo/PR/SHA exatos), PR aberto/não-draft, base/head corretos, checks GitHub verdes; confirma merge via `gh pr view` pós-merge (nunca confia só no exit code). **Não serializa merges concorrentes entre PRs diferentes** |
 | `review_pipeline.py` | Madura | Independência de revisor **forçada em código** (`ValueError` se implementador == revisor). Escalonamento 3-falhas → `CEO_ESCALATION_REQUIRED` |
 | `persistence.py` | Madura | SQLite WAL, `Store` único por processo, RLock, `run_in_transaction`/`run_sync_once` atômicos entre conexões |
@@ -25,7 +25,7 @@
 | `healthcheck.py` | Madura | Probes GitHub/Paperclip, heartbeats, diagnóstico de idle (bloqueado por dependência vs Paperclip fora vs agente pausado) |
 | `github_client.py` | Madura | Usa `gh` CLI via subprocess com lista de argumentos (nunca shell=True); rate-limit com cooldown persistido cross-processo; sem PR/merge/labels (isso é `merge_policy.py`) |
 | `telegram_bot.py` / `decisions.py` | Madura | Parser de linguagem natural sem slash-commands (`Objetivo:`, `sim`/`nao`, `prioriza`, `ref: <id> <resposta>`); voz via Groq Whisper; sem risco de injeção de comando (nenhum subprocess/eval recebe texto do Telegram) |
-| `voice_facade.py` | Existe, mas **isolado** | Único ponto de integração sancionado voz↔orchestrator (`handle_status_query`, `handle_report_query`, `handle_control_query`). Só está importado numa **cópia forkada** de `main.py` dentro do repo do orchestrator — não no monólito real. Chamada é função Python síncrona no mesmo processo (não HTTP/IPC) |
+| `voice_facade.py` | Existe, **acoplado em processo** | Único ponto de integração sancionado voz↔orchestrator (`handle_status_query`, `handle_report_query`, `handle_control_query`). **Correção pós-review (Codex)**: o `main.py` deste worktree (branch `integration/orchestration`) já importa e chama `voice_facade` de fato (`main.py:52`, chamadas em `:1663`, `:1672`, `:1681`) — não é uma "cópia forkada esquecida", é código real e integrado nesta branch. O gap real é dois: (1) é chamada de função Python síncrona no mesmo processo — sem isolamento de falha, se `orchestrator/` travar/lançar exceção fora do bloco `try/except` de import, pode afetar a voz; (2) **o monólito de voz rodando ao vivo agora** (`Desktop\Jarvis-AI-For-Windows-2026`, branch `main`, PID 10880) é um checkout separado que ainda **não** tem essa wiring — é um gap de deploy/rollout, não de código-fonte inexistente. `handle_control_query` hoje só responde honestamente que não há pause/resume real implementado — não é um facade incompleto por acidente, é escopo ainda não implementado |
 | **WORK_PROTOCOL.md** | Documentado, não aplicado em código | Checkpoints por domínio, Review Tasks como Issues GitHub (`type:review`), regra de prioridade P0-P3, regra de ociosidade, lista de Issues SOLO (#11,#30,#35,#41,#45,#46) — **tudo isso é convenção seguida manualmente por Claude/Codex, não enforcement mecânico** |
 
 ## 3. Paperclip
@@ -65,6 +65,12 @@ Bem coberto: `github_client.py` calcula deadline de cooldown a partir de `Retry-
 - Orchestrator: `.env` + `orchestrator/config.py` (loader manual, não usa `python-dotenv` pacote) com `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CONTROL_CHAT_ID`, `TELEGRAM_REPORT_CHAT_ID`, `GROQ_API_KEY` (cópia separada, mesma chave conceitual do monólito), `PAPERCLIP_BASE_URL`/`PAPERCLIP_API_TOKEN`. GitHub não usa token de env — delega para sessão do `gh` CLI.
 - **Existe um `config.py` duplicado** (mesmos valores, byte-a-byte igual) no repo do orchestrator, também gitignored.
 - Nenhum uso de keyring/cofre de SO.
+
+## 11. Achados da review independente (Codex) incorporados
+
+- **Estado de dispatch não é durável**: quando o Paperclip recebe uma task, `orchestrator.py:468/476` só anexa o ID a uma lista de retorno — nunca persiste a transição `READY → IN_PROGRESS`. `paperclip_sync.py:66/68/104` depois pula direto de `READY`/`IN_PROGRESS` para `DONE` quando o Paperclip termina. Isso significa que "quantas tasks estão realmente em andamento agora" não é uma pergunta que o `Store` consegue responder com confiança hoje — afeta relatório (`run_report()`), diagnóstico de idle, recovery pós-crash, e qualquer lock futuro baseado em estado.
+- **Review Tasks (Issues GitHub) não são criadas em código**: `WORK_PROTOCOL.md` exige que toda implementação pronta para revisão vire uma Issue real com label `type:review` (§75-83). `review_pipeline.py` registra o veredito da revisão (pass/fail, contagem de falhas) mas não cria nem força a existência dessas Issues — é convenção seguida manualmente por Claude/Codex, não código.
+- Nomes de estado corretos no `models.py`: `IN_PROGRESS` e `IN_REVIEW` (não "WORKING"/"REVIEW" — erro corrigido nesta revisão).
 
 ## 10. Recuperação / crash
 
