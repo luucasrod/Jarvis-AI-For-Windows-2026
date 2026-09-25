@@ -19,6 +19,7 @@ or a manual re-run) never duplicates GitHub Issues or Paperclip tasks.
 """
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -302,6 +303,17 @@ def _solo_conflict_blocks_dispatch(store: Store, task_id: str, project_id: str) 
     return store.run_in_transaction(apply)
 
 
+def _read_paperclip_status(session, company_id: str, task_id: str, store: Store) -> dict:
+    method = session.get_task_status
+    try:
+        accepts_store = "store" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        accepts_store = True
+    if accepts_store:
+        return method(company_id, task_id, store=store)
+    return method(company_id, task_id)
+
+
 def _mark_dispatched_in_progress(
     store: Store, task_id: str, project_id: str, now: datetime,
 ) -> bool:
@@ -522,7 +534,7 @@ def run_daily_cycle(
                 continue
             paperclip_created.append(task.id)
 
-            status = paperclip_session.get_task_status(company_id, result["task_id"])
+            status = _read_paperclip_status(paperclip_session, company_id, result["task_id"], store)
             confirmed_assignee = (
                 status.get("available") and isinstance(status.get("task"), dict)
                 and status["task"].get("assigneeAgentId") == agent_id
