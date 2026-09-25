@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     created_at TEXT NOT NULL,
     PRIMARY KEY (correlation_id, kind)
 );
+
+CREATE TABLE IF NOT EXISTS github_api_cache (
+    cache_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    fetched_at REAL NOT NULL
+);
 """
 
 
